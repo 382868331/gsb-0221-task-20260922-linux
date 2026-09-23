@@ -1,1 +1,2 @@
-# Python 3.14.7 standard library only.
+# No third-party dependencies: Python 3.14.7 standard library only.
+# Tests and demo run offline with a plain interpreter.
