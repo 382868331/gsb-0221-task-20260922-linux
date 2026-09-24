@@ -1,9 +1,12 @@
 # himeb — 层级多项计数的确定性经验贝叶斯
 
-纯 Python 标准库实现的小样本层级模型估计模块：多组 K 类计数共享一个对称
-Dirichlet 先验 `Dirichlet(alpha,…,alpha)`，通过最大化（Dirichlet-）多项边际
-似然（证据）估计浓度参数 `alpha`，并给出每组的后验均值、方差与新样本类别
-预测。
+纯 Python 标准库实现的小样本层级模型估计模块：多组 K 类计数共享一个
+Dirichlet 先验，通过最大化（Dirichlet-）多项边际似然（证据）估计浓度参数，
+并给出每组的后验均值、方差与新样本类别预测。先验支持两种形式：
+
+- **对称**：`Dirichlet(alpha,…,alpha)`，单一标量浓度（括区间一维搜索拟合）；
+- **每类别独立**：`Dirichlet(alpha_1,…,alpha_K)`，浓度向量（有限次定点迭代
+  拟合，限制正浓度并显式报告是否收敛）。
 
 - **Python**：3.14.7（仅用标准库 `math`、`dataclasses`、`typing`）
 - **依赖**：无。安装 Python 后无需 `pip install` 任何东西，完全离线。
@@ -13,7 +16,7 @@ Dirichlet 先验 `Dirichlet(alpha,…,alpha)`，通过最大化（Dirichlet-）�
 
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（含独立参考对照）
-python demo.py                            # 固定输入演示，约 0.03 秒
+python demo.py                            # 固定输入演示，约 0.06 秒
 ```
 
 ## 模型与数学
@@ -48,6 +51,44 @@ predictive_k = mean_k                  # 一步多项预测 = 后验均值
 predicted    = argmax(predictive)      # 平局取最小下标
 ```
 
+## 每类别独立浓度（非对称先验）
+
+`log_evidence` / `log_evidence_one` / `posterior_group` 的 alpha 参数除标量外，
+也接受长度 K 的正浓度序列 `(alpha_1,…,alpha_K)`（标量调用行为逐位不变）。
+单组对数证据：
+
+```
+log p(x|alpha_1..K) = log C(n; x)
+  + logGamma(A) - logGamma(n + A)
+  + Σ_k [ logGamma(x_k + alpha_k) - logGamma(alpha_k) ],   A = Σ_k alpha_k
+```
+
+后验均值 `mean_k = (alpha_k + x_k) / (A + n)`，方差公式同上（`a_k = alpha_k +
+x_k`，`A` 换成 `A + n`）。空组后验为归一化先验 `alpha_k / A`（不再一定是均匀
+分布）。对称退化成立：等值向量与标量路径逐位一致（测试断言精确相等）。
+
+### 有限迭代浓度拟合：`fit_concentrations`
+
+用 Minka 定点迭代最大化每类别证据（不动点恰为证据驻点 `score_k = 0`）：
+
+```
+alpha_k ← alpha_k * S_k / D
+S_k = Σ_g [ ψ(x_gk + alpha_k) - ψ(alpha_k) ]
+D   = Σ_g [ ψ(n_g + A) - ψ(A) ]
+```
+
+- 每步迭代投影到显式正区间 `[ALPHA_MIN, ALPHA_MAX]`，任何更新都不会逃出
+  合法区域；落边界的类别在 `clamped_classes` 中报告（全零计数类静止在
+  `ALPHA_MIN`，永不为 0）。
+- **有限预算**：至多 `max_iter` 次更新（默认 1000），相对变化小于 `tol`
+  （默认 1e-10）判收敛。预算耗尽返回 `status="max_iter_exhausted"`、
+  `converged=False`——这是报告而非异常，返回的仍是合法正浓度向量。
+- 全空组批次为证明性 `flat`（证据恒 0），不迭代，`alphas=(1.0,…,1.0)`。
+- `start` 可选：None（默认全 1 向量）、正标量（广播）或长度 K 正向量。
+- 注意：只有单抽（n=1）组时浓度总量不可辨识（证据只依赖比例），迭代保持
+  起始总量不变，收敛到到该总量下的比例点；这是模型性质，不是缺陷。
+- `analyze_concentrations` = `fit_concentrations` + 全部组后验，对齐返回。
+
 ## 优化：括区间一维搜索
 
 在 `t = log(alpha)` 的**显式闭区间** `[1e-4, 1e4]`（常量 `ALPHA_MIN/MAX`）
@@ -76,17 +117,23 @@ predicted    = argmax(predictive)      # 平局取最小下标
 ```python
 from himeb import (
     log_evidence, log_evidence_one,   # 证据（任意正 alpha；区间只管优化器）
-    fit_alpha,                        # 仅拟合 alpha -> FitResult
+    fit_alpha,                        # 仅拟合对称 alpha -> FitResult
     maximize_on_interval,             # 通用多峰一维最大化引擎 f(alpha)
     posterior_group,                  # 单组后验均值/方差/预测
-    analyze,                          # 拟合 + 全部组后验 -> EBResult
+    analyze,                          # 对称拟合 + 全部组后验 -> EBResult
+    fit_concentrations,               # 每类别浓度向量拟合 -> ConcentrationFit
+    analyze_concentrations,           # 上述拟合 + 全部组后验 -> EBConcentrationResult
     ALPHA_MIN, ALPHA_MAX, MAX_K, MAX_GROUPS,
 )
 ```
 
+`log_evidence` / `log_evidence_one` / `posterior_group` 的 alpha 参数：正标量
+（对称先验）或长度 K 的正浓度序列（每类别先验）。`posterior_group` 返回的
+`GroupPosterior.alpha` 回显所传形式（标量 float 或 tuple）。
+
 结果均为不可变 dataclass（`Candidate`、`FitResult`、`GroupPosterior`、
-`EBResult`）；所有函数为纯函数、无状态，非法批次在产出任何结果前整体抛错，
-不存在部分变更。
+`EBResult`、`ConcentrationFit`、`EBConcentrationResult`）；所有函数为纯函数、
+无状态，非法批次在产出任何结果前整体抛错，不存在部分变更。
 
 ```python
 result = analyze([(4, 0, 1), (0, 3, 0), (0, 0, 0)])
@@ -96,6 +143,13 @@ result.fit.candidates       # 全部候选（含 bracket、iterations、converge
 result.posteriors[0].mean   # 后验均值
 result.posteriors[0].variance
 result.posteriors[0].predictive
+
+fit = fit_concentrations([(9, 0, 0), (5, 4, 0), (8, 0, 1)])
+fit.alphas                  # 每类别浓度向量（严格为正）
+fit.status                  # converged / max_iter_exhausted / flat
+fit.converged               # False 时结果为最后迭代值，不是已证最优
+fit.iterations, fit.final_step, fit.clamped_classes
+fit.log_evidence            # 返回点处的每类别证据
 ```
 
 ## 输入上限与错误语义
@@ -104,11 +158,13 @@ result.posteriors[0].predictive
 - 计数为非负 `int`，单个计数上限 `2**53`（超出无法作为 float64 精确参与证据
   计算，直接拒绝）。
 - 数值输入（alpha、目标函数返回值）拒绝 `NaN`/`±Infinity`；alpha 必须 > 0。
+  浓度向量长度必须等于 K，每个元素独立校验，错误信息带下标（如
+  `alpha[1] must be > 0`）。
 - **bool 不是整数**：计数、`grid_points`、`max_iter` 传 `True/False` 抛
   `TypeError`。
 - 类型不符抛 `TypeError`，取值非法抛 `ValueError`；错误信息带可定位坐标
   （如 `group 1 class 0: ...`），不静默纠正、不钳制。
-- `grid_points >= 3`、`max_iter >= 1`。
+- `grid_points >= 3`、`max_iter >= 1`；`tol` 必须是 `(0, 1)` 内的有限浮点数。
 
 ## 浮点误差口径（不用宽容差掩盖边界）
 
@@ -134,6 +190,12 @@ result.posteriors[0].predictive
     不单点尖峰时有效），绝对差 **≤ 2e-9**；
   - 后验矩另用独立的 beta 积分比 `B(a+1,b)/B(a,b)` 交叉核对（alpha ≤ 10）。
   生产实现与参考的期望值由独立公式各自算出；“往返一致”仅作补充。
+- **每类别浓度**：K=2 非对称证据与独立 beta 闭式 `B(x+a0,n-x+a1)/B(a0,a1)`
+  差 ≤ 1e-12、与自适应 Simpson 直接积分差 ≤ 1e-9；K=3 用小 n 上升阶乘
+  手算式核对到 1e-14；等值向量与标量路径逐位一致（精确相等断言）；类别
+  置换下证据不变、拟合向量随之置换。拟合驻点用**独立参考证据的有限差分**
+  梯度核对（|score| < 1e-4），不调用生产实现的 digamma。digamma 用递推 +
+  渐近展开（x ≥ 8，到 x^-10 项），绝对误差 < 1e-12。
 - **优化**：内部模在 t 空间定位到 `1e-12` 括号宽度；端点为精确函数值。
   拟合 alpha 与独立 4001 点密扫描的相对差 ≤ 2%（密扫描自身分辨率有限），
   证据在拟合点自洽到 1e-10。
@@ -152,18 +214,25 @@ result.posteriors[0].predictive
   `maximize_on_interval` + 合成双模目标在测试中验证（两个内模均被找到并细化）。
 - **空组 / 单抽组不“拟合噪声”**：证据贡献为解析常数时直接判 `flat`，
   而不是让数值搜索在机器噪声里随便挑一个点。
-- 只实现本题契约的数学子集（对称先验、单一共享 alpha、上述上限），不宣称
-  任何行业标准协议兼容。
+- 只实现本题契约的数学子集（对称先验单一共享 alpha、每类别独立浓度向量、
+  上述上限），不宣称任何行业标准协议兼容。
 
 ## 已知限制
 
 - 网格可能漏掉**窄于一个网格单元且峰顶落在格点之间**的模；`tests` 中有用
   3 点网格故意漏模、2001 点网格找到的对照用例。增大 `grid_points` 可缓解。
-- 先验固定为对称形式、全组共享单一 alpha；不支持非对称基率、组级协变量或
-  层级超先验。
-- `flat` 情形无数据信息，按约定返回 `alpha=1.0` 供后验计算，不代表估计值。
+- 对称先验固定为全组共享单一 alpha；每类别先验为单层浓度向量。不支持组级
+  协变量、组间树状共享或多层浓度联合估计、层级超先验。
+- 浓度定点迭代是**线性收敛**：当似然推向边界（某类从未观测，或各组比例
+  高度一致使总浓度想趋于无穷）时，迭代只能按比例爬向投影边界，有限预算
+  会如实报 `max_iter_exhausted` 而非收敛；对称一维拟合对同类情形用端点
+  状态表达。需要更紧结果可增大 `max_iter`。
+- 只有单抽（n=1）组时浓度总量不可辨识，迭代收敛到保持起始总量的比例点。
+- `flat` 情形无数据信息，按约定返回 `alpha=1.0`（或全 1 向量）供后验计算，
+  不代表估计值。
 - 参考展开式在 n 很大且 alpha 很小时交错相消明显，因此参考测试限定在
-  题设的小计数范围；生产实现用整数 log 和不受此限。
+  题设的小计数范围；生产实现用整数 log 和不受此限。非对称 beta 闭式参考
+  在浓度很大时同样有 lgamma 相消，参考测试限定在中等浓度。
 - 独立 Simpson 积分参考在被积函数宽度 ≪ 1（如 a=1、x=0、n=400 时尖峰
   宽约 1/n）时，固定递归深度（30 层）不足以分辨，会严重低估；这是参考
   数值方法的限制（此时改用 `p(x)=1/(n+1)` 闭式事实核对），不是生产证据的
@@ -173,9 +242,9 @@ result.posteriors[0].predictive
 ## 仓库结构
 
 ```
-himeb/core.py        # 核心：证据、优化器、后验、校验
+himeb/core.py        # 核心：证据（对称/每类别）、优化器、浓度迭代、后验、校验
 himeb/__init__.py    # 公开接口
-tests/reference.py   # 独立参考（展开 / 数值积分 / beta 矩 / 密扫描）
-tests/test_*.py      # 校验、证据与后验对照、优化与层级测试
+tests/reference.py   # 独立参考（展开 / 数值积分 / beta 矩 / 密扫描 / 非对称 beta）
+tests/test_*.py      # 校验、证据与后验对照、优化与层级测试、每类别浓度测试
 demo.py              # 固定输入演示
 ```

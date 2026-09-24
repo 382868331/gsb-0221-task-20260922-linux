@@ -6,7 +6,9 @@ standalone derivations:
 * beta-binomial marginal likelihood via binomial expansion + beta integrals
   (signed log-sum-exp accumulation for numerical stability);
 * the same marginal via direct adaptive-Simpson quadrature on [0, 1];
-* posterior Beta moments as beta-integral ratios.
+* posterior Beta moments as beta-integral ratios;
+* asymmetric (per-class concentration) K=2 marginals via the closed-form
+  beta-integral ratio and via adaptive-Simpson quadrature.
 """
 
 from __future__ import annotations
@@ -142,3 +144,55 @@ def dense_alpha_scan(
         if v > best_v:
             best_t, best_v = t, v
     return math.exp(best_t), best_v
+
+
+def evidence_beta_binomial(x: int, n: int, a0: float, a1: float) -> float:
+    """log p(X=x | a0, a1), K=2 with per-class (asymmetric) concentrations.
+
+    Direct beta-integral ratio (the defining identity, no production code):
+        p(x) = C(n, x) * B(x + a0, n - x + a1) / B(a0, a1).
+    """
+    if not 0 <= x <= n:
+        raise ValueError("require 0 <= x <= n")
+    if a0 <= 0.0 or a1 <= 0.0:
+        raise ValueError("concentrations must be positive")
+    return (
+        math.log(math.comb(n, x))
+        + log_beta(x + a0, n - x + a1)
+        - log_beta(a0, a1)
+    )
+
+
+def evidence_quadrature_asym(
+    x: int, n: int, a0: float, a1: float, tol: float = 1e-12
+) -> float:
+    """Direct numerical integral of the K=2 asymmetric marginal.
+
+    Integrates C(n,x) p^x (1-p)^(n-x) p^(a0-1) (1-p)^(a1-1) / B(a0,a1)
+    over [0, 1] with adaptive Simpson.  Reliable when the integrand
+    vanishes at both endpoints (x >= 1, n - x >= 1, a0 >= 1, a1 >= 1).
+    """
+    if not 0 <= x <= n:
+        raise ValueError("require 0 <= x <= n")
+    log_norm = -log_beta(a0, a1)
+    log_coef = math.log(math.comb(n, x))
+
+    def integrand(p: float) -> float:
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        log_val = (
+            log_coef
+            + (x + a0 - 1.0) * math.log(p)
+            + (n - x + a1 - 1.0) * math.log1p(-p)
+            + log_norm
+        )
+        if log_val < -745.0:
+            return 0.0
+        return math.exp(min(log_val, 700.0))
+
+    fm = integrand(0.5)
+    whole = 1.0 / 6.0 * (4.0 * fm)
+    integral = _adaptive_simpson(
+        integrand, 0.0, 1.0, 0.0, 0.0, fm, whole, tol, depth=30
+    )
+    return math.log(integral)

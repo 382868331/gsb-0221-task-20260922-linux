@@ -13,7 +13,14 @@ from __future__ import annotations
 import math
 import time
 
-from himeb import analyze, fit_alpha, log_evidence
+from himeb import (
+    ALPHA_MIN,
+    analyze,
+    analyze_concentrations,
+    fit_alpha,
+    fit_concentrations,
+    log_evidence,
+)
 
 
 def _demo_counts() -> list[tuple[int, int, int]]:
@@ -127,6 +134,78 @@ def main() -> None:
         print(f"  TypeError raised as specified: {exc}")
     else:
         raise RuntimeError("expected a TypeError for a bool count")
+
+    print()
+    print("=" * 72)
+    print("PART 4. Per-class concentrations Dirichlet(a1,...,aK): fit + posteriors")
+    print("=" * 72)
+    # Lopsided, over-dispersed deterministic batch (class 0 dominant).
+    rows = [
+        (9, 0, 0), (5, 4, 0), (8, 0, 1), (4, 5, 0),
+        (9, 1, 0), (3, 6, 0), (7, 1, 1), (2, 6, 1),
+    ]
+    result = analyze_concentrations(rows)
+    fit = result.fit
+    print(
+        f"fitted alphas = {tuple(round(a, 6) for a in fit.alphas)}   "
+        f"status = {fit.status}   converged = {fit.converged}"
+    )
+    print(
+        f"iterations = {fit.iterations}/{fit.max_iter}   "
+        f"final relative step = {fit.final_step:.3g}   "
+        f"log evidence = {fit.log_evidence:.6f}"
+    )
+    sym = fit_alpha(rows)
+    print(
+        f"symmetric-prior fit for comparison: alpha = {sym.alpha:.6f} "
+        f"(status {sym.status}), log evidence = {sym.log_evidence:.6f}"
+    )
+    print(
+        f"per-class evidence gain over symmetric = "
+        f"{fit.log_evidence - sym.log_evidence:.6f}"
+    )
+    print("posterior means with the fitted per-class prior:")
+    for i, (row, post) in enumerate(zip(rows, result.posteriors)):
+        mean_s = "(" + ", ".join(f"{p:.3f}" for p in post.mean) + ")"
+        print(f"  group {i} {str(row):>10} -> mean {mean_s}  pred class {post.predicted}")
+
+    print()
+    print("=" * 72)
+    print("PART 5. Concentration boundaries: clamping and non-convergence")
+    print("=" * 72)
+    # Class 1 is never observed: its concentration is clamped to ALPHA_MIN
+    # (never zero), while class 0's likelihood seeks the upper boundary and
+    # the finite iteration budget is honestly reported as exhausted.
+    zfit = fit_concentrations([(5, 0), (9, 0), (2, 0), (6, 0)])
+    print(
+        f"never-observed class: alphas = {zfit.alphas!r}  "
+        f"status = {zfit.status}  clamped_classes = {zfit.clamped_classes}"
+    )
+    print(f"  ALPHA_MIN = {ALPHA_MIN} (positivity constraint held)")
+    one = fit_concentrations(rows, max_iter=1)
+    print(
+        f"budget of 1 iteration: converged = {one.converged}  "
+        f"status = {one.status}  iterations = {one.iterations} "
+        "(reported, not raised)"
+    )
+    # All-empty batch: proved flat, no iteration at all.
+    flat = fit_concentrations([(0, 0, 0), (0, 0, 0)])
+    print(
+        f"all-empty batch: status = {flat.status}  alphas = {flat.alphas}  "
+        f"iterations = {flat.iterations}"
+    )
+
+    print()
+    print("=" * 72)
+    print("PART 6. A per-class error boundary that actually fires")
+    print("=" * 72)
+    print("Calling log_evidence with a 3-vector alpha on K=2 data ...")
+    try:
+        log_evidence((0.5, 0.5, 0.5), [(1, 2)])
+    except ValueError as exc:
+        print(f"  ValueError raised as specified: {exc}")
+    else:
+        raise RuntimeError("expected a ValueError for a length mismatch")
 
     elapsed = time.perf_counter() - t0
     print()
