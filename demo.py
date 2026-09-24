@@ -3,9 +3,12 @@
 Run:  python demo.py
 
 Everything below is deterministic and genuinely computed (no sleep, no
-pre-recorded numbers): a normal hierarchical fit showing shrinkage, the three
-optimizer statuses on extreme inputs, and one rejection/exception boundary
-that really fires.
+pre-recorded numbers): a normal symmetric hierarchical fit showing shrinkage;
+the new per-class-concentration fit (marginal likelihood, fitted class
+concentrations, posterior means) including a never-observed class pinned to
+the box edge and a boundary-MLE batch that honestly fails to converge within
+its finite iteration budget; and rejection/exception boundaries that really
+fire.
 """
 
 from __future__ import annotations
@@ -13,7 +16,14 @@ from __future__ import annotations
 import math
 import time
 
-from himeb import analyze, fit_alpha, log_evidence
+from himeb import (
+    analyze,
+    analyze_dirichlet,
+    fit_alpha,
+    fit_alphas,
+    log_evidence,
+    log_evidence_dirichlet,
+)
 
 
 def _demo_counts() -> list[tuple[int, int, int]]:
@@ -91,7 +101,93 @@ def main() -> None:
 
     print()
     print("=" * 72)
-    print("PART 2. Endpoint / interior / proved-flat optimizer states")
+    print("PART 2. Per-class concentrations (non-symmetric Dirichlet)")
+    print("=" * 72)
+    # Classes play visibly different roles: class 0 is common, class 2 rare.
+    groups_v = [
+        (4, 0, 1),
+        (0, 3, 0),
+        (2, 2, 1),
+        (5, 0, 0),
+        (1, 1, 3),
+        (0, 0, 0),  # empty group: prior only, excluded from the evidence
+    ]
+    dres = analyze_dirichlet(groups_v)
+    dfit = dres.fit
+    print(
+        f"groups={dres.n_groups} (non-empty={dres.n_nonempty_groups}), "
+        f"K={dres.k}"
+    )
+    print(
+        "fitted per-class alpha = "
+        + ", ".join(f"{a:.5f}" for a in dfit.alphas)
+    )
+    print(
+        f"total log marginal likelihood = {dfit.log_evidence:.6f}   "
+        f"status = {dfit.status}   converged = {dfit.converged}"
+    )
+    print(
+        f"finite-iteration fit: sweeps used = {dfit.sweeps_used}/"
+        f"{dfit.sweeps}, at box edge = {dfit.at_box}, "
+        f"max 1-D iterations = {dfit.max_iterations_used}"
+    )
+    # The symmetric model restricted to a0=a1=a2 cannot reach this evidence.
+    sym = fit_alpha(groups_v)
+    print(
+        f"symmetric-only best log evidence = {sym.log_evidence:.6f} "
+        f"(alpha={sym.alpha:.5f}); per-class gain = "
+        f"{dfit.log_evidence - sym.log_evidence:.6f} (>= 0, as the "
+        "symmetric line is a subset of the per-class box)"
+    )
+    print()
+    print(
+        f"{'group':>6} {'n':>3} {'counts':>12} {'posterior mean':>22}  pred"
+    )
+    for i, (row, post) in enumerate(zip(groups_v, dres.posteriors)):
+        mean_s = "(" + ", ".join(f"{p:.3f}" for p in post.mean) + ")"
+        print(
+            f"{i:>6} {post.n:>3} {str(row):>12} {mean_s:>22}  "
+            f"class {post.predicted}"
+        )
+    post = dres.posteriors[0]
+    print()
+    print("Posterior detail, group 0 = (4, 0, 1):")
+    print(f"  mean       = {tuple(round(m, 6) for m in post.mean)}")
+    print(f"  variance   = {tuple(round(v, 6) for v in post.variance)}")
+
+    print()
+    print("-- boundary: a never-observed class rests on the lower edge --")
+    edge_rows = [(2, 0, 0), (0, 2, 0), (3, 0, 0), (0, 1, 0)]
+    er = fit_alphas(edge_rows, sweeps=300)
+    print(f"  groups {edge_rows}")
+    print(
+        f"  alphas = ({', '.join(f'{a:.5f}' for a in er.alphas)})  "
+        f"at_box = {er.at_box}  status = {er.status}"
+    )
+
+    print()
+    print("-- reported non-convergence: boundary MLE, finite budget --")
+    # All groups concentrate on class 0: the EB MLE escapes toward infinite
+    # concentration, so no finite-box point is a stationary optimum. With a
+    # deliberately small sweep budget the fit must say so rather than lie.
+    bm_rows = [(3, 0), (2, 0), (1, 1)]
+    br = fit_alphas(bm_rows, sweeps=20)
+    print(f"  groups {bm_rows}")
+    print(
+        f"  alphas after 20 sweeps = ({br.alphas[0]:.3f}, "
+        f"{br.alphas[1]:.3f})  status = {br.status}  "
+        f"converged = {br.converged}  budget_exhausted = "
+        f"{br.budget_exhausted}"
+    )
+    ev_at_one = log_evidence_dirichlet((1.0, 1.0), bm_rows)
+    print(
+        f"  evidence {br.log_evidence:.6f} is still above the start value "
+        f"{ev_at_one:.6f}: the ascent is real, only un-finished."
+    )
+
+    print()
+    print("=" * 72)
+    print("PART 3. Endpoint / interior / proved-flat symmetric states")
     print("=" * 72)
     cases = [
         ("all observations in one class (extreme)", [(6, 0)] * 6),
@@ -110,7 +206,7 @@ def main() -> None:
 
     print()
     print("=" * 72)
-    print("PART 3. An error boundary that actually fires")
+    print("PART 4. Error boundaries that actually fire")
     print("=" * 72)
     print("Calling log_evidence(alpha=nan, groups=[(1, 2)]) ...")
     try:
@@ -127,6 +223,22 @@ def main() -> None:
         print(f"  TypeError raised as specified: {exc}")
     else:
         raise RuntimeError("expected a TypeError for a bool count")
+
+    print("Calling log_evidence_dirichlet(alphas=(0.5, 0), ...) ...")
+    try:
+        log_evidence_dirichlet((0.5, 0.0), [(1, 2)])
+    except ValueError as exc:
+        print(f"  ValueError raised as specified: {exc}")
+    else:
+        raise RuntimeError("expected a ValueError for a zero concentration")
+
+    print("Calling fit_alphas with an init outside the fit box ...")
+    try:
+        fit_alphas([(1, 2)], init=(1.0, 1e9))
+    except ValueError as exc:
+        print(f"  ValueError raised as specified: {exc}")
+    else:
+        raise RuntimeError("expected a ValueError for an out-of-box init")
 
     elapsed = time.perf_counter() - t0
     print()

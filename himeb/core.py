@@ -3,22 +3,36 @@
 A reusable, standard-library-only module for the following small-sample
 hierarchical model::
 
-    theta_g ~ Dirichlet(alpha, alpha, ..., alpha)   # K classes, symmetric
-    x_g     ~ Multinomial(n_g, theta_g)              # g = 1..G groups
+    theta_g ~ Dirichlet(alpha_1, alpha_2, ..., alpha_K)   # K classes
+    x_g     ~ Multinomial(n_g, theta_g)                   # g = 1..G groups
 
-A single concentration ``alpha`` is shared by every group and estimated by
-maximizing the summed (Dirichlet-)multinomial marginal likelihood on the
-explicit interval ``[ALPHA_MIN, ALPHA_MAX]``, optimizing over ``log(alpha)``.
+Two parameterizations are supported, sharing the same evidence/post-processing
+code:
+
+* **symmetric** (``alpha_1 = ... = alpha_K = alpha``): a single shared
+  concentration estimated by :func:`fit_alpha` on the explicit interval
+  ``[ALPHA_MIN, ALPHA_MAX]``, optimizing over ``log(alpha)``;
+* **per-class** (independent ``alpha_k > 0``): :func:`fit_alphas` runs a
+  finite-iteration cyclic coordinate search over the box
+  ``[ALPHA_MIN, ALPHA_MAX]**K``, reusing the same bracket-preserving 1-D
+  engine for each coordinate, and reports convergence explicitly.
 
 Public API
 ----------
-log_evidence(alpha, groups) -> float
+log_evidence(alpha, groups) -> float                 # symmetric scalar
+log_evidence_one(alpha, counts) -> float
+log_evidence_dirichlet(alphas, groups) -> float      # per-class vector
 fit_alpha(groups, *, grid_points=201, max_iter=100) -> FitResult
+fit_alphas(groups, *, init=None, sweeps=60,
+           grid_points=25, max_iter=100) -> AlphasFitResult
 posterior_group(counts, alpha) -> GroupPosterior
-analyze(groups, *, grid_points=201, max_iter=100) -> EBResult
+posterior_group_dirichlet(counts, alphas) -> DirichletGroupPosterior
+analyze(groups, ...) -> EBResult
+analyze_dirichlet(groups, ...) -> DirichletEBResult
 
 Contract limits: 2 <= K <= 6, 1 <= G <= 40, non-negative integer counts.
-Numeric inputs reject NaN/Infinity; integer parameters reject ``bool``.
+Numeric inputs reject NaN/Infinity; integer parameters reject ``bool``; every
+concentration must be strictly positive.
 """
 
 from __future__ import annotations
@@ -39,6 +53,19 @@ MAX_GROUPS = 40
 DEFAULT_GRID_POINTS = 201
 DEFAULT_MAX_ITER = 100
 
+# Per-class fit defaults: cyclic coordinate sweeps over [ALPHA_MIN, ALPHA_MAX]^K.
+DEFAULT_SWEEPS = 60
+DEFAULT_DIRICHLET_GRID_POINTS = 25
+
+# Relative convergence threshold for the per-class coordinate search: a sweep
+# counts as converged only when the total-log-evidence gain falls below this
+# fraction of the current value magnitude (absolute floor 1e-12). Each 1-D
+# step localizes its maximizer to T_TOL/2 in t = log(alpha); the sweep
+# tolerance is set near that attainable floor so termination is driven by a
+# genuine evidence plateau rather than a loose budget.
+EVIDENCE_REL_TOL = 1e-13
+_EVIDENCE_ABS_FLOOR = 1e-13
+
 # Golden-section stopping width in t = log(alpha) units.
 T_TOL = 1e-12
 
@@ -55,6 +82,10 @@ STATUS_INTERIOR = "interior"
 STATUS_LOWER_ENDPOINT = "lower_endpoint"
 STATUS_UPPER_ENDPOINT = "upper_endpoint"
 STATUS_FLAT = "flat"
+
+# Per-class coordinate-fit statuses.
+STATUS_CONVERGED = "converged"
+STATUS_MAX_SWEEPS_REACHED = "max_sweeps_reached"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +248,89 @@ def log_evidence(alpha: object, groups: Sequence[Sequence[int]]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Per-class (non-symmetric) Dirichlet evidence
+# ---------------------------------------------------------------------------
+
+
+def _validate_alphas(
+    alphas: Sequence[float], k: int | None
+) -> tuple[tuple[float, ...], int]:
+    """Validate a per-class concentration vector of length K.
+
+    Every entry must be a finite, strictly positive number (bool rejected);
+    when ``k`` is given, the vector length must equal it.
+    """
+    if isinstance(alphas, (str, bytes)) or not isinstance(alphas, Sequence):
+        raise TypeError(
+            "alphas must be a sequence of positive numbers, got "
+            f"{type(alphas).__name__}"
+        )
+    kk = len(alphas)
+    if k is not None and kk != k:
+        raise ValueError(
+            f"alphas has length {kk}, expected K={k}"
+        )
+    if not 2 <= kk <= MAX_K:
+        raise ValueError(f"alphas has length {kk}; require 2 <= K <= {MAX_K}")
+    out: list[float] = []
+    for j, raw in enumerate(alphas):
+        if isinstance(raw, bool):
+            raise TypeError(
+                f"alpha class {j}: concentration must be int or float, got bool"
+            )
+        if not isinstance(raw, (int, float)):
+            raise TypeError(
+                f"alpha class {j}: concentration must be int or float, got "
+                f"{type(raw).__name__}: {raw!r}"
+            )
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(
+                f"alpha class {j}: concentration must be finite and not "
+                f"NaN/Infinity, got {raw!r}"
+            )
+        if value <= 0.0:
+            raise ValueError(
+                f"alpha class {j}: concentration must be > 0, got {raw!r}"
+            )
+        out.append(value)
+    return tuple(out), kk
+
+
+def _log_evidence_row_vec(
+    alphas: tuple[float, ...], row: tuple[int, ...]
+) -> float:
+    """Dirichlet-multinomial log evidence with class-specific alphas."""
+    n = sum(row)
+    if n == 0:
+        # An empty draw has probability 1 for every prior parameter value.
+        return 0.0
+    log_coef = math.lgamma(n + 1) - math.fsum(
+        math.lgamma(c + 1) for c in row
+    )
+    a0 = math.fsum(alphas)
+    return (
+        log_coef
+        - _lgamma_add(a0, n)
+        + math.fsum(_lgamma_add(a, c) for a, c in zip(alphas, row))
+    )
+
+
+def log_evidence_dirichlet(
+    alphas: Sequence[float], groups: Sequence[Sequence[int]]
+) -> float:
+    """Summed log marginal likelihood under Dirichlet(alpha_1,...,alpha_K).
+
+    Every concentration must be finite and strictly positive (no box clamp
+    here: the ``[ALPHA_MIN, ALPHA_MAX]`` box only constrains the optimizer).
+    Empty groups contribute zero.
+    """
+    rows, k = _validate_groups(groups)
+    avec, _ = _validate_alphas(alphas, k)
+    return math.fsum(_log_evidence_row_vec(avec, row) for row in rows)
+
+
+# ---------------------------------------------------------------------------
 # Bracket-preserving 1-D maximizer on a finite t interval
 # ---------------------------------------------------------------------------
 
@@ -256,16 +370,28 @@ def _golden_max(
             d, fd = c, fc
             c = b - (b - a) * ratio
             fc = f(c)
-        else:
+        elif fc < fd:
             a = c
             c, fc = d, fd
             d = a + (b - a) * ratio
             fd = f(d)
+        else:
+            # Exact tie: the top is flat to evaluation precision. Shrinking
+            # from one side only would walk the bracket off the maximizer
+            # (successive ties all take the same branch), so contract both
+            # ends to [c, d]; its midpoint equals (a+b)/2, keeping the bracket
+            # centered on the mode instead of drifting.
+            a, b = c, d
+            c = b - (b - a) * ratio
+            d = a + (b - a) * ratio
+            fc, fd = f(c), f(d)
         if b - a <= T_TOL:
             break
-    if fc >= fd:
-        return c, fc, used, (b - a) <= T_TOL
-    return d, fd, used, (b - a) <= T_TOL
+    # The maximizer is guaranteed to lie in the final bracket [a, b]. Return
+    # its midpoint: geometric error is at most (b-a)/2 <= T_TOL/2 even when
+    # the top is unresolvable by function value.
+    m = 0.5 * (a + b)
+    return m, f(m), used, (b - a) <= T_TOL
 
 
 def _maximize_1d(
@@ -585,6 +711,240 @@ def analyze(
     fit = fit_alpha(rows, grid_points=grid_points, max_iter=max_iter)
     posteriors = tuple(posterior_group(row, fit.alpha) for row in rows)
     return EBResult(
+        k=k,
+        n_groups=len(rows),
+        n_nonempty_groups=fit.n_nonempty_groups,
+        fit=fit,
+        posteriors=posteriors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-class concentration fit: cyclic coordinate ascent over the positive box
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AlphasFitResult:
+    """Outcome of the finite-iteration per-class concentration fit.
+
+    ``status`` is one of ``converged`` / ``max_sweeps_reached`` / ``flat``.
+    Unlike the symmetric case, a batch whose non-empty groups all hold a single
+    draw is NOT flat here: a lone draw favours its observed class with a
+    concentration ratio, so the evidence depends on the per-class vector and
+    its maximum typically sits on the box (``at_box`` reports this).
+    """
+
+    alphas: tuple[float, ...]
+    log_evidence: float
+    status: str
+    converged: bool
+    sweeps: int
+    sweeps_used: int
+    grid_points: int
+    max_iterations_used: int
+    at_box: tuple[bool, ...]  # per class: resting on ALPHA_MIN/ALPHA_MAX
+    n_nonempty_groups: int
+
+    @property
+    def budget_exhausted(self) -> bool:
+        """True iff the sweep budget ran out before the gain tolerance."""
+        return not self.converged and self.status != STATUS_FLAT
+
+
+@dataclass(frozen=True)
+class DirichletGroupPosterior:
+    counts: tuple[int, ...]
+    n: int
+    is_empty: bool
+    alphas: tuple[float, ...]
+    mean: tuple[float, ...]
+    variance: tuple[float, ...]
+    predictive: tuple[float, ...]
+    predicted: int  # argmax of predictive; ties resolved to the lowest index
+
+
+@dataclass(frozen=True)
+class DirichletEBResult:
+    k: int
+    n_groups: int
+    n_nonempty_groups: int
+    fit: AlphasFitResult
+    posteriors: tuple[DirichletGroupPosterior, ...]
+
+
+def fit_alphas(
+    groups: Sequence[Sequence[int]],
+    *,
+    init: Sequence[float] | None = None,
+    sweeps: int = DEFAULT_SWEEPS,
+    grid_points: int = DEFAULT_DIRICHLET_GRID_POINTS,
+    max_iter: int = DEFAULT_MAX_ITER,
+) -> AlphasFitResult:
+    """Fit independent per-class concentrations by cyclic coordinate ascent.
+
+    Each sweep maximizes the total log evidence over one ``alpha_j`` on
+    ``[ALPHA_MIN, ALPHA_MAX]`` with the other coordinates fixed, using the
+    same grid-plus-bracketed-golden-section engine as :func:`fit_alpha`.
+    Every 1-D slice of the Dirichlet-multinomial evidence is strictly concave
+    for a non-empty batch — its second derivative is
+    ``[psi'(A) - psi'(A+n_g)] + [psi'(alpha_j+x_gj) - psi'(alpha_j)] < 0``
+    summed over groups (trigamma is strictly decreasing) — so each coordinate
+    step has a unique boxed maximum.
+
+    Positivity is enforced by the closed box rather than by clamping: no
+    candidate outside ``[ALPHA_MIN, ALPHA_MAX]`` is ever evaluated. The
+    iteration budget is finite and reported honestly — ``converged=False`` /
+    ``status='max_sweeps_reached'`` when the evidence gain of a full sweep
+    does not fall below ``EVIDENCE_REL_TOL`` (relative, floor 1e-12) within
+    ``sweeps`` sweeps. All-empty batches are the only proved-flat case and
+    return alpha = 1 for every class without searching.
+    """
+    rows, k = _validate_groups(groups)
+    sw = _reject_bool_int("sweeps", sweeps, 1)
+    gp = _reject_bool_int("grid_points", grid_points, 3)
+    mi = _reject_bool_int("max_iter", max_iter, 1)
+    if init is None:
+        current = (1.0,) * k
+    else:
+        current, _ = _validate_alphas(init, k)
+        for j, a in enumerate(current):
+            if not ALPHA_MIN <= a <= ALPHA_MAX:
+                raise ValueError(
+                    f"init class {j}: concentration {a!r} must lie inside the "
+                    f"fit box [{ALPHA_MIN}, {ALPHA_MAX}]"
+                )
+
+    nonempty = tuple(row for row in rows if sum(row) > 0)
+    if not nonempty:
+        # Evidence identically zero for every parameter vector: provably no
+        # unique maximizer, not a budget condition.
+        return AlphasFitResult(
+            alphas=(1.0,) * k,
+            log_evidence=0.0,
+            status=STATUS_FLAT,
+            converged=True,
+            sweeps=sw,
+            sweeps_used=0,
+            grid_points=gp,
+            max_iterations_used=0,
+            at_box=(False,) * k,
+            n_nonempty_groups=0,
+        )
+
+    def slice_objective(j: int, fixed: tuple[float, ...]):
+        def f(a_j: float) -> float:
+            vec = fixed[:j] + (a_j,) + fixed[j + 1:]
+            return math.fsum(_log_evidence_row_vec(vec, r) for r in nonempty)
+
+        return f
+
+    value = math.fsum(_log_evidence_row_vec(current, r) for r in nonempty)
+    max_iterations_used = 0
+    converged = False
+    sweeps_used = 0
+
+    for sweeps_used in range(1, sw + 1):
+        before = value
+        for j in range(k):
+            step = maximize_on_interval(
+                slice_objective(j, current),
+                grid_points=gp,
+                max_iter=mi,
+            )
+            max_iterations_used = max(
+                max_iterations_used, step.max_iterations_used
+            )
+            current = current[:j] + (step.alpha,) + current[j + 1:]
+            value = step.log_evidence
+        gain = value - before
+        tol = max(_EVIDENCE_ABS_FLOOR, EVIDENCE_REL_TOL * abs(value))
+        if 0.0 <= gain <= tol:
+            converged = True
+            break
+        # A negative gain cannot happen when each coordinate step maximizes
+        # over a closed interval containing the current point; guard anyway
+        # against treating numerical noise as progress.
+        if gain < -tol:
+            raise RuntimeError(  # pragma: no cover - defensive invariant
+                f"coordinate ascent decreased evidence by {gain}; "
+                "bracketed maximizer violated containment"
+            )
+
+    at_box = tuple(
+        a <= ALPHA_MIN * (1.0 + 1e-9) or a >= ALPHA_MAX * (1.0 - 1e-9)
+        for a in current
+    )
+    return AlphasFitResult(
+        alphas=current,
+        log_evidence=value,
+        status=(
+            STATUS_CONVERGED if converged else STATUS_MAX_SWEEPS_REACHED
+        ),
+        converged=converged,
+        sweeps=sw,
+        sweeps_used=sweeps_used,
+        grid_points=gp,
+        max_iterations_used=max_iterations_used,
+        at_box=at_box,
+        n_nonempty_groups=len(nonempty),
+    )
+
+
+def posterior_group_dirichlet(
+    counts: Sequence[int], alphas: Sequence[float]
+) -> DirichletGroupPosterior:
+    """Posterior summary under Dirichlet(alpha_1,...,alpha_K).
+
+    The posterior is Dirichlet(alpha_k + x_k); empty vectors return the
+    prior itself.
+    """
+    rows, k = _validate_groups([counts])
+    avec, _ = _validate_alphas(alphas, k)
+    row = rows[0]
+    n = sum(row)
+    post_a = tuple(a + c for a, c in zip(avec, row))
+    total = math.fsum(post_a)
+    mean = tuple(a / total for a in post_a)
+    variance = tuple(
+        a * (total - a) / (total * total * (total + 1.0)) for a in post_a
+    )
+    # One-step-ahead multinomial predictive: equals the posterior mean.
+    predictive = mean
+    predicted = 0
+    for j in range(1, k):
+        if predictive[j] > predictive[predicted]:
+            predicted = j
+    return DirichletGroupPosterior(
+        counts=row,
+        n=n,
+        is_empty=(n == 0),
+        alphas=avec,
+        mean=mean,
+        variance=variance,
+        predictive=predictive,
+        predicted=predicted,
+    )
+
+
+def analyze_dirichlet(
+    groups: Sequence[Sequence[int]],
+    *,
+    init: Sequence[float] | None = None,
+    sweeps: int = DEFAULT_SWEEPS,
+    grid_points: int = DEFAULT_DIRICHLET_GRID_POINTS,
+    max_iter: int = DEFAULT_MAX_ITER,
+) -> DirichletEBResult:
+    """Fit per-class concentrations and summarize every group's posterior."""
+    rows, k = _validate_groups(groups)
+    fit = fit_alphas(
+        rows, init=init, sweeps=sweeps,
+        grid_points=grid_points, max_iter=max_iter,
+    )
+    posteriors = tuple(
+        posterior_group_dirichlet(row, fit.alphas) for row in rows
+    )
+    return DirichletEBResult(
         k=k,
         n_groups=len(rows),
         n_nonempty_groups=fit.n_nonempty_groups,
