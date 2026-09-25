@@ -12,8 +12,8 @@ Dirichlet 先验 `Dirichlet(alpha,…,alpha)`，通过最大化（Dirichlet-）�
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（含独立参考对照）
-python demo.py                            # 固定输入演示，约 0.03 秒
+./.venv/bin/python -m unittest discover -s tests -v   # 必要测试（含独立参考对照）
+./.venv/bin/python demo.py                            # 固定输入演示，< 1 秒
 ```
 
 ## 模型与数学
@@ -78,14 +78,15 @@ from himeb import (
     log_evidence, log_evidence_one,   # 证据（任意正 alpha；区间只管优化器）
     fit_alpha,                        # 仅拟合 alpha -> FitResult
     maximize_on_interval,             # 通用多峰一维最大化引擎 f(alpha)
-    posterior_group,                  # 单组后验均值/方差/预测
-    analyze,                          # 拟合 + 全部组后验 -> EBResult
-    ALPHA_MIN, ALPHA_MAX, MAX_K, MAX_GROUPS,
+   posterior_group,                  # 单组后验均值/方差/预测
+    posterior_predictive,            # 后验预测事件概率与条件期望（m<=100）
+   analyze,                          # 拟合 + 全部组后验 -> EBResult
+    ALPHA_MIN, ALPHA_MAX, MAX_K, MAX_GROUPS, MAX_PREDICTIVE_M,
 )
 ```
 
 结果均为不可变 dataclass（`Candidate`、`FitResult`、`GroupPosterior`、
-`EBResult`）；所有函数为纯函数、无状态，非法批次在产出任何结果前整体抛错，
+`EBResult`、`PredictiveResult`）；所有函数为纯函数、无状态，非法批次在产出任何结果前整体抛错，
 不存在部分变更。
 
 ```python
@@ -98,6 +99,60 @@ result.posteriors[0].variance
 result.posteriors[0].predictive
 ```
 
+## 后验预测：下一批 m 次观测落入计数区间的概率
+
+共同先验拟合完成后，对某组已观测计数 `x`，其后验为
+`Dirichlet(a_k)`，`a_k = alpha + x_k`；下一批 `m` 次计数 `y` 因此服从
+**Dirichlet-multinomial（复合多项）分布**，而不是把后验均值代进普通多项分布：
+
+```
+p(y | x, alpha) = C(m; y) * Gamma(A) / Gamma(A + m)
+                  * prod_k Gamma(a_k + y_k) / Gamma(a_k),   A = sum_k a_k
+```
+
+入口 `posterior_predictive(counts, alpha, m, bounds)` 返回不可变
+`PredictiveResult`：事件概率、`log_probability`、后验参数
+`posterior_params = alpha + counts`，以及**该事件条件下**每类期望计数
+`conditional_mean`。计算以本次传入（即拟合得到）的 `alpha` 为条件，**不重新
+拟合、不引入非对称先验或 alpha 的超先验**；拟合端点状态仍保留在 `FitResult`
+中不变。
+
+**核心算法：按类别 × 累计计数的 log 域动态规划。** 把上面的分布按类别分解为
+逐类因子 `w_k(c) = Gamma(a_k+c)/(Gamma(a_k) c!)`，公共归一化常数
+`Z = Gamma(A+m)/(Gamma(A) m!)` 在事件概率比中消去。DP 逐类做受限卷积
+（`dp[c]` = 前 k 类计数之和为 c 且均在各自界内的 log 总权重），时间
+O(K·m·区间宽度)，`m <= 100`、`K <= 6` 时毫秒级，**不枚举 K 维计数单纯形**。
+所有累加走 log-sum-exp，事件概率小到 ~1e-17 也不会下溢；
+`Gamma(x+m)/Gamma(x)` 沿用证据模块的精确 log 和。
+
+条件均值用“留一类重组”计算：
+`E[y_k·1_事件] = sum_c c·w_k(c)·F_<k(·)·S_>k(·)`，其中 `F/S` 是同一套 DP 的
+前向/后缀表，同样在 log 域完成；数值上 `sum_k conditional_mean = m`。
+
+边界约定：
+
+- `bounds` 为每类一个闭区间 `(lower_k, upper_k)`，要求
+  `0 <= lower <= upper <= m`；长度必须等于 K。
+- **上下界总和不可能达到 m 时直接返回零**（不运行 DP）：当
+  `sum(lower) > m` 或 `sum(upper) < m`，界内不存在总和为 m 的计数向量。
+- 空事件：`probability = 0.0`、`log_probability = -inf`、
+  `is_empty_event = True`，`conditional_mean` 全部为 `nan`——零概率事件下的
+  条件均值**未定义**，不用 0 冒充。
+- **m = 0 单独处理**：唯一可能的计数向量是全 0，若所有 `lower_k = 0`
+  （此时 upper 也只能是 0）则概率 1、条件均值全 0。
+- `0 <= m <= MAX_PREDICTIVE_M = 100`；`m` 为 int，`bool` 按整数契约拒绝。
+
+```python
+from himeb import fit_alpha, posterior_predictive
+fit = fit_alpha([(4, 0, 1), (0, 3, 0), (2, 2, 1)])
+r = posterior_predictive((4, 0, 1), fit.alpha, 20, [(4, 14), (0, 6), (2, 10)])
+r.probability          # 事件概率
+r.log_probability      # log 域概率（极小事件不下溢）
+r.conditional_mean     # 事件条件下的每类期望计数，和为 m
+r.posterior_params     # (alpha+x_0, ...)，即 DM 后验参数
+```
+
+
 ## 输入上限与错误语义
 
 - 类数 `2 <= K <= 6`；组数 `1 <= G <= 40`；所有组长度必须一致。
@@ -109,6 +164,8 @@ result.posteriors[0].predictive
 - 类型不符抛 `TypeError`，取值非法抛 `ValueError`；错误信息带可定位坐标
   （如 `group 1 class 0: ...`），不静默纠正、不钳制。
 - `grid_points >= 3`、`max_iter >= 1`。
+- 后验预测 `0 <= m <= 100`（`MAX_PREDICTIVE_M`）；每个界
+  `0 <= lower_k <= upper_k <= m`，界对数必须等于 K。
 
 ## 浮点误差口径（不用宽容差掩盖边界）
 
@@ -138,7 +195,14 @@ result.posteriors[0].predictive
   拟合 alpha 与独立 4001 点密扫描的相对差 ≤ 2%（密扫描自身分辨率有限），
   证据在拟合点自洽到 1e-10。
 - **后验矩**：纯乘除，相对误差为机器精度量级（~1e-15）；均值之和在
-  1e-12 内归一。
+ 1e-12 内归一。
+- **后验预测 DP**：全部权重与卷积在 log 域（log-sum-exp）累加，公共归一化
+  常数在概率比中消去；事件概率与条件均值在小 m（m ≤ 8）上与**全枚举独立
+  参考** `dm_event_enumeration`（逐向量有限乘积，见 `tests/reference.py`）
+  逐组随机 300 例对照（K=2..6、alpha∈[1e-4,1e4]、含空事件与 m=0），
+  概率绝对差 ≤ 1e-9、条件均值绝对差 ≤ 1e-8；全范围事件概率为 1（1e-12）、
+  条件均值之和为 m（1e-6 相对口径）；极小可行事件（~1e-17）经 log 域仍可
+  重建。误差主体是 binary64 级别的舍入，未用宽容差掩盖边界语义。
 
 ## 设计取舍
 
@@ -153,7 +217,12 @@ result.posteriors[0].predictive
 - **空组 / 单抽组不“拟合噪声”**：证据贡献为解析常数时直接判 `flat`，
   而不是让数值搜索在机器噪声里随便挑一个点。
 - 只实现本题契约的数学子集（对称先验、单一共享 alpha、上述上限），不宣称
-  任何行业标准协议兼容。
+ 任何行业标准协议兼容。
+- **后验预测用复合分布而非“均值代入”**：后验 `Dirichlet(alpha+x)` 与多项
+  采样复合为 Dirichlet-multinomial，正确反映 theta 不确定性带来的
+  过离散；条件均值经“留一类”前向/后缀 DP 一次算出，不额外做 K 次重复 DP。
+  预测严格以调用方给出的拟合 alpha 为条件（端点解保持其端点状态），本入口
+  不重新拟合、不加非对称先验或超先验，也不新增拟合器。
 
 ## 已知限制
 
@@ -169,13 +238,20 @@ result.posteriors[0].predictive
   数值方法的限制（此时改用 `p(x)=1/(n+1)` 闭式事实核对），不是生产证据的
   误差。
 - 模块只做计算，不提供 CLI 产品、网站、看板或持久化。
+- 后验预测上限 `m <= 100`、`K <= 6`（与原类数上限一致）；更大 m/K 不在
+  本契约内，直接拒绝而不静默截断。
+- 空事件的条件期望未定义（返回 `nan`，不返回 0）；m=0 只有全零向量一种
+  结果，已单独分支处理。
+- DP 为精确 log 域卷积（除 log/exp 本身的 binary64 舍入外无离散化近似），
+  但结果仍以单一拟合 alpha 为条件，未对 alpha 的拟合不确定性积分。
 
 ## 仓库结构
 
 ```
 himeb/core.py        # 核心：证据、优化器、后验、校验
+himeb/predictive.py  # 后验预测：Dirichlet-multinomial log 域 DP
 himeb/__init__.py    # 公开接口
-tests/reference.py   # 独立参考（展开 / 数值积分 / beta 矩 / 密扫描）
+tests/reference.py   # 独立参考（展开 / 数值积分 / beta 矩 / 密扫描 / DM 枚举）
 tests/test_*.py      # 校验、证据与后验对照、优化与层级测试
 demo.py              # 固定输入演示
 ```

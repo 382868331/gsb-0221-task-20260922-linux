@@ -142,3 +142,70 @@ def dense_alpha_scan(
         if v > best_v:
             best_t, best_v = t, v
     return math.exp(best_t), best_v
+
+
+# ---------------------------------------------------------------------------
+# Independent Dirichlet-multinomial event reference: full enumeration of
+# the small-m count simplex. This never imports himeb; each count vector has
+# the direct finite product probability
+#   C(m; y) * B(a+y)/B(a) = m! Gamma(A)/Gamma(A+m)
+#                            * prod_k Gamma(a_k+y_k)/(Gamma(a_k) y_k!)
+# It is tractable only for small m (used with m <= 8 in the tests) and is
+# deliberately the naive K-dimensional enumeration the production code
+# must not rely on.
+# ---------------------------------------------------------------------------
+
+
+def dm_event_enumeration(params, m, bounds):
+    """Brute-force (probability, conditional_means) of a bounded event.
+
+    params = posterior Dirichlet parameters a_k > 0; bounds = list of
+    (lower_k, upper_k). Means are None when the event probability is 0.
+    """
+    k = len(params)
+    total_a = sum(params)
+    log_norm = math.lgamma(m + 1) + math.lgamma(total_a) - math.lgamma(
+        total_a + m
+    )
+    log_p_a = [math.lgamma(a) for a in params]
+    prob = 0.0
+    weighted = [0.0] * k
+
+    def recurse(j, remaining, log_w, chosen):
+        nonlocal prob
+        if j == k - 1:
+            y = chosen + [remaining]
+            if not (bounds[j][0] <= remaining <= bounds[j][1]):
+                return
+            lp = log_w + math.lgamma(params[j] + remaining)
+            lp -= log_p_a[j] + math.lgamma(remaining + 1)
+            p = math.exp(log_norm + lp)
+            prob += p
+            for t in range(k):
+                weighted[t] += p * y[t]
+            return
+        lo = max(
+            bounds[j][0],
+            remaining - sum(bounds[t][1] for t in range(j + 1, k)),
+        )
+        hi = min(
+            bounds[j][1],
+            remaining - sum(bounds[t][0] for t in range(j + 1, k)),
+        )
+        for c in range(lo, hi + 1):
+            nxt = (
+                log_w
+                + math.lgamma(params[j] + c)
+                - log_p_a[j]
+                - math.lgamma(c + 1)
+            )
+            recurse(j + 1, remaining - c, nxt, chosen + [c])
+
+    lo0 = max(bounds[0][0], m - sum(bounds[t][1] for t in range(1, k)))
+    hi0 = min(bounds[0][1], m - sum(bounds[t][0] for t in range(1, k)))
+    for c in range(lo0, hi0 + 1):
+        start = math.lgamma(params[0] + c) - log_p_a[0] - math.lgamma(c + 1)
+        recurse(1, m - c, start, [c])
+    if prob == 0.0:
+        return 0.0, None
+    return prob, tuple(w / prob for w in weighted)

@@ -15,9 +15,11 @@ Public API
 log_evidence(alpha, groups) -> float
 fit_alpha(groups, *, grid_points=201, max_iter=100) -> FitResult
 posterior_group(counts, alpha) -> GroupPosterior
+posterior_predictive(counts, alpha, m, bounds) -> PredictiveResult
 analyze(groups, *, grid_points=201, max_iter=100) -> EBResult
 
 Contract limits: 2 <= K <= 6, 1 <= G <= 40, non-negative integer counts.
+Posterior prediction adds m <= 100 future draws.
 Numeric inputs reject NaN/Infinity; integer parameters reject ``bool``.
 """
 
@@ -35,6 +37,7 @@ ALPHA_MIN = 1e-4
 ALPHA_MAX = 1e4
 MAX_K = 6
 MAX_GROUPS = 40
+MAX_PREDICTIVE_M = 100
 
 DEFAULT_GRID_POINTS = 201
 DEFAULT_MAX_ITER = 100
@@ -383,6 +386,27 @@ class EBResult:
     n_nonempty_groups: int
     fit: FitResult
     posteriors: tuple[GroupPosterior, ...]
+
+
+@dataclass(frozen=True)
+class PredictiveResult:
+    """Posterior-predictive event probability and conditional class means.
+
+    The event is ``lower[k] <= y_k <= upper[k]`` for every class k, where
+    ``y`` is the count vector of ``m`` future draws. ``log_probability``
+    is ``-inf`` and ``conditional_mean`` is all-NaN when the event has
+    probability zero (conditional means are then undefined).
+    """
+
+    m: int
+    alpha: float
+    posterior_params: tuple[float, ...]
+    lower: tuple[int, ...]
+    upper: tuple[int, ...]
+    log_probability: float
+    probability: float
+    conditional_mean: tuple[float, ...]
+    is_empty_event: bool
 
 
 # ---------------------------------------------------------------------------

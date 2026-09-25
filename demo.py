@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 
-from himeb import analyze, fit_alpha, log_evidence
+from himeb import analyze, fit_alpha, log_evidence, posterior_predictive
 
 
 def _demo_counts() -> list[tuple[int, int, int]]:
@@ -127,6 +127,57 @@ def main() -> None:
         print(f"  TypeError raised as specified: {exc}")
     else:
         raise RuntimeError("expected a TypeError for a bool count")
+
+    print()
+    print("=" * 72)
+    print("PART 4. Posterior-predictive event for the next m draws")
+    print("=" * 72)
+    print("Dirichlet-multinomial (NOT a posterior-mean plug-in); the fitted")
+    print("alpha from the batches above is held fixed for this prediction.")
+    print()
+    t_pred = time.perf_counter()
+    obs = (4, 0, 1)
+    m_future = 20
+    event_bounds = [(4, 14), (0, 6), (2, 10)]
+    pp = posterior_predictive(obs, fit.alpha, m_future, event_bounds)
+    print(f"observed counts = {obs}, m = {m_future} future draws")
+    pp_params = tuple(round(v, 4) for v in pp.posterior_params)
+    print(f"posterior Dirichlet params a_k = alpha + x = {pp_params}")
+    print(f"event bounds [lower, upper] per class = {event_bounds}")
+    print(f"P(event) = {pp.probability:.8f}   (log P = {pp.log_probability:.6f})")
+    pp_mean = "(" + ", ".join(f"{v:.4f}" for v in pp.conditional_mean) + ")"
+    print(f"conditional expected counts | event = {pp_mean}")
+    print(f"sanity: conditional means sum to {sum(pp.conditional_mean):.6f} (== m)")
+    print()
+    full = posterior_predictive(obs, fit.alpha, m_future, [(0, m_future)] * 3)
+    full_mean = "(" + ", ".join(f"{v:.4f}" for v in full.conditional_mean) + ")"
+    print(f"full-range check: P(0 <= y_k <= m) = {full.probability:.12f}")
+    print(f"unconditional Dirichlet-multinomial means = {full_mean}")
+    print()
+    empty = posterior_predictive(obs, fit.alpha, m_future, [(0, 5)] * 3)
+    nan_s = "(" + ", ".join("nan" for _ in empty.conditional_mean) + ")"
+    print(f"infeasible box [(0,5)]*3: is_empty={empty.is_empty_event}, "
+          f"P={empty.probability}, conditional_mean={nan_s} (undefined)")
+    print()
+    big = posterior_predictive(
+        (3, 1, 0, 2, 5, 1),
+        fit.alpha,
+        100,
+        [(10, 30), (5, 25), (0, 20), (5, 25), (10, 30), (0, 20)],
+    )
+    dp_dt = time.perf_counter() - t_pred
+    print(
+        f"m=100, K=6 dynamic program: P(event) = {big.probability:.6f}, "
+        f"sum conditional means = {sum(big.conditional_mean):.6f}, "
+        f"computed in {dp_dt:.3f}s"
+    )
+    print("Calling posterior_predictive with m > 100 ...")
+    try:
+        posterior_predictive((1, 1), fit.alpha, 101, [(0, 101)] * 2)
+    except ValueError as exc:
+        print(f"  ValueError raised as specified: {exc}")
+    else:
+        raise RuntimeError("expected a ValueError for m > MAX_PREDICTIVE_M")
 
     elapsed = time.perf_counter() - t0
     print()
