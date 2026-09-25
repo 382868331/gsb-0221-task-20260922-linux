@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 
-from himeb import analyze, fit_alpha, log_evidence
+from himeb import analyze, fit_alpha, log_evidence, predictive_event
 
 
 def _demo_counts() -> list[tuple[int, int, int]]:
@@ -127,6 +127,61 @@ def main() -> None:
         print(f"  TypeError raised as specified: {exc}")
     else:
         raise RuntimeError("expected a TypeError for a bool count")
+
+    print()
+    print("=" * 72)
+    print("PART 4. Posterior-predictive box event (Dirichlet-multinomial)")
+    print("=" * 72)
+    # Conditional on THIS fit: the observed group (4,0,1) has posterior
+    # Dirichlet(alpha+4, alpha, alpha+1). Ask about a future batch of m=12
+    # with class-0 count in [5, 9] and class-1 count in [0, 3].
+    alpha_fit = fit.alpha
+    observed = groups[0]
+    m_future = 12
+    box = [(5, 9), (0, 3), (0, 12)]
+    event = predictive_event(observed, alpha_fit, m_future, box)
+    print(
+        f"observed group = {observed}, fitted alpha = {alpha_fit:.6f} "
+        "(computation is conditional on this fit; no asymmetric prior, "
+        "alpha uncertainty, or refitting is added)"
+    )
+    print(
+        f"future m = {m_future}; event: 5 <= Y0 <= 9, 0 <= Y1 <= 3, "
+        "0 <= Y2 <= 12"
+    )
+    print(
+        f"  P(event) = {event.probability:.8f}   "
+        f"log P = {event.log_probability:.6f}"
+    )
+    print(
+        "  E[Y | event] = "
+        + "(" + ", ".join(f"{v:.4f}" for v in event.conditional_mean) + ")"
+        + f"  (sums to {sum(event.conditional_mean):.4f} = m)"
+    )
+    # The posterior mean is deliberately NOT plugged into a plain
+    # multinomial; show the marginal Dirichlet-multinomial mean instead.
+    a_post = [alpha_fit + c for c in observed]
+    marg = tuple(m_future * a / sum(a_post) for a in a_post)
+    print(
+        "  marginal E[Y] (no box, Dirichlet-multinomial) = "
+        + "(" + ", ".join(f"{v:.4f}" for v in marg) + ")"
+    )
+    impossible = predictive_event(
+        observed, alpha_fit, m_future, [(10, 12), (10, 12), (0, 12)]
+    )
+    print(
+        "  impossible box (two classes each need >= 10 of 12): "
+        f"P = {impossible.probability}, conditional_mean = "
+        f"{impossible.conditional_mean} (undefined for zero-probability "
+        "events)"
+    )
+    empty_future = predictive_event(
+        observed, alpha_fit, 0, [(0, 0), (0, 0), (0, 0)]
+    )
+    print(
+        "  m = 0 with the all-zero box: "
+        f"P = {empty_future.probability}, means = {empty_future.conditional_mean}"
+    )
 
     elapsed = time.perf_counter() - t0
     print()

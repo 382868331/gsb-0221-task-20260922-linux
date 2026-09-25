@@ -18,6 +18,9 @@ from .core import (
     log_evidence_one,
     maximize_on_interval,
     posterior_group,
+    predictive_event,
+    PredictiveEventResult,
+    MAX_PREDICT_M,
 )
 
 __all__ = [
@@ -35,4 +38,7 @@ __all__ = [
     "log_evidence_one",
     "maximize_on_interval",
     "posterior_group",
+    "predictive_event",
+    "PredictiveEventResult",
+    "MAX_PREDICT_M",
 ]

@@ -12,9 +12,12 @@ Dirichlet 先验 `Dirichlet(alpha,…,alpha)`，通过最大化（Dirichlet-）�
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（含独立参考对照）
-python demo.py                            # 固定输入演示，约 0.03 秒
+./.venv/bin/python -m unittest discover -s tests -v  # 必要测试（含独立参考对照）
+./.venv/bin/python demo.py                           # 固定输入演示，约 0.1 秒
 ```
+
+若没有现成虚拟环境，用系统解释器亦可（仅标准库）：
+`python3.14 -m unittest discover -s tests -v`、`python3.14 demo.py`。
 
 ## 模型与数学
 
@@ -46,6 +49,54 @@ mean_k       = (alpha + x_k) / (K*alpha + n)
 variance_k   = a_k (A - a_k) / (A^2 (A + 1)),  a_k = alpha+x_k, A = K*alpha+n
 predictive_k = mean_k                  # 一步多项预测 = 后验均值
 predicted    = argmax(predictive)      # 平局取最小下标
+```
+
+## 后验预测：未来一批 m 次观测的盒事件
+
+`predictive_event(counts, alpha, m, bounds)` 回答：对某组已观测计数
+`counts`，在**本次拟合得到的** `alpha`（或任意给定正 alpha）下，后验
+`Dirichlet(alpha + counts)` 对未来 `m` 次（`0 <= m <= 100`，常量
+`MAX_PREDICT_M=100`；类别沿用 `2 <= K <= 6`）观测计数 `Y` 的预测中，事件
+`L_k <= Y_k <= U_k`（每类一个闭区间，共 K 个）的概率，以及该事件条件下的
+各类期望计数 `E[Y_k | 事件]`。
+
+预测分布是**后验预测 Dirichlet–多项（Polya 罐）**，边际掉 theta 后保留过度
+离散；**不把后验均值直接代入普通多项分布**。计算以传入的这次拟合 alpha 为
+条件：不对 alpha 的不确定性再积分，也不引入非对称先验或新的拟合器。
+
+Dirichlet–多项的质量可以分解成按类别的独立有限乘积：
+
+```
+p(y) = m! * Gamma(A)/(Gamma(A+m))
+       * Π_k Gamma(a_k+y_k)/(Gamma(a_k) y!),   a_k = alpha+counts_k, A = Σ a_k
+```
+
+核心算法按“类别 × 累计计数”做**前向 + 后向动态规划**（O(K m^2)，
+K=6,m=100 约 60 ms）：前向 DP 求全空间配分函数 Z 与事件内配分函数 Z_E，
+`P(事件) = Z_E/Z`；每类条件分布由“前面前缀 × 本类因子 × 后面后缀”在
+log 域 log-sum-exp 拼接得到，再乘 y 求条件均值。**不枚举任何 K 维计数向量**。
+所有递推在 log 域按层减最大值缩放（log-sum-exp），极小概率不先下溢；
+`log_probability` 同时返回。
+
+特殊情况：
+
+- **m=0 单独处理**：唯一可行向量为全零，盒含原点时概率 1、条件均值全 0，
+  否则概率 0；
+- **上下界总和不可能达到 m**（Σ L_k > m 或 Σ U_k < m）直接返回精确零，
+  另有 DP 可达性筛掉“逐区间合法但联合不可行”的情况；
+- 条件概率为零时条件均值未定义，`conditional_mean` 为 `None`，
+  `log_probability` 为 `-inf`。
+
+返回不可变 dataclass `PredictiveEventResult`（`counts, alpha, m, bounds,
+probability, log_probability, conditional_mean`）。
+
+```python
+from himeb import fit_alpha, predictive_event
+alpha = fit_alpha([(4, 0, 1), (0, 3, 0), (2, 2, 1)]).alpha
+r = predictive_event((4, 0, 1), alpha, 12, [(5, 9), (0, 3), (0, 12)])
+r.probability          # P(5<=Y0<=9, 0<=Y1<=3)
+r.log_probability      # log 域，稀有事件不依赖 float 下溢阈值
+r.conditional_mean     # E[Y | 事件]，各类之和恰为 m；概率 0 时为 None
 ```
 
 ## 优化：括区间一维搜索
@@ -80,12 +131,13 @@ from himeb import (
     maximize_on_interval,             # 通用多峰一维最大化引擎 f(alpha)
     posterior_group,                  # 单组后验均值/方差/预测
     analyze,                          # 拟合 + 全部组后验 -> EBResult
-    ALPHA_MIN, ALPHA_MAX, MAX_K, MAX_GROUPS,
+    predictive_event,                 # 后验预测盒事件概率与条件期望
+    ALPHA_MIN, ALPHA_MAX, MAX_K, MAX_GROUPS, MAX_PREDICT_M,
 )
 ```
 
 结果均为不可变 dataclass（`Candidate`、`FitResult`、`GroupPosterior`、
-`EBResult`）；所有函数为纯函数、无状态，非法批次在产出任何结果前整体抛错，
+`EBResult`、`PredictiveEventResult`）；所有函数为纯函数、无状态，非法批次在产出任何结果前整体抛错，
 不存在部分变更。
 
 ```python
@@ -157,6 +209,13 @@ result.posteriors[0].predictive
 
 ## 已知限制
 
+- 后验预测以传入的（这次拟合的）`alpha` 为条件，不对 alpha 的后验/
+  自助法不确定性做积分；`flat` 情形使用约定 alpha=1.0。`m` 上限 100、
+  `K` 上限 6 是接口边界；更大的 m/K 不支持。
+- DP 在 log 域按层缩放，概率与条件期望对 m<=100 与独立全枚举参考的差在
+  1e-10 以内（见 `tests/test_predictive.py`）；极端稀有事件的 `probability`
+  若低于 ~5e-324 会下溢为 0，此时以 `log_probability` 为准。
+
 - 网格可能漏掉**窄于一个网格单元且峰顶落在格点之间**的模；`tests` 中有用
   3 点网格故意漏模、2001 点网格找到的对照用例。增大 `grid_points` 可缓解。
 - 先验固定为对称形式、全组共享单一 alpha；不支持非对称基率、组级协变量或
@@ -176,6 +235,6 @@ result.posteriors[0].predictive
 himeb/core.py        # 核心：证据、优化器、后验、校验
 himeb/__init__.py    # 公开接口
 tests/reference.py   # 独立参考（展开 / 数值积分 / beta 矩 / 密扫描）
-tests/test_*.py      # 校验、证据与后验对照、优化与层级测试
+tests/test_*.py      # 校验、证据与后验对照、优化、后验预测盒事件
 demo.py              # 固定输入演示
 ```
