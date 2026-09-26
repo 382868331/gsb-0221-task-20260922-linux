@@ -142,3 +142,54 @@ def dense_alpha_scan(
         if v > best_v:
             best_t, best_v = t, v
     return math.exp(best_t), best_v
+
+
+def _compositions(total: int, k: int, prefix: tuple[int, ...] = ()):
+    if k == 1:
+        yield prefix + (total,)
+        return
+    for value in range(total + 1):
+        yield from _compositions(total - value, k - 1, prefix + (value,))
+
+
+def _fine_dm_log_evidence(counts: tuple[int, ...], alpha: float) -> float:
+    """Standalone Dirichlet-multinomial formula for fully observed counts."""
+    k = len(counts)
+    total = sum(counts)
+    log_coef = math.lgamma(total + 1) - math.fsum(
+        math.lgamma(count + 1) for count in counts
+    )
+
+    def log_rising(x: float, amount: int) -> float:
+        # The small test totals allow the exact product identity, avoiding
+        # cancellation between two large lgamma values at alpha=1e4.
+        return math.fsum(math.log(x + j) for j in range(amount))
+
+    log_beta_num = math.fsum(log_rising(alpha, count) for count in counts)
+    log_beta_den = log_rising(k * alpha, total)
+    return log_coef + log_beta_num - log_beta_den
+
+
+def partition_evidence_by_enumeration(
+    blocks: list[tuple[tuple[int, ...], int]], alpha: float
+) -> float:
+    """Enumerate every fine count vector compatible with aggregate blocks.
+
+    This deliberately does not aggregate the Dirichlet-multinomial formula;
+    it sums independent fine-count likelihoods over the finite event set.
+    It is practical only for small totals and is intended as a test oracle.
+    """
+    k = max(class_index for classes, _ in blocks for class_index in classes) + 1
+    total = sum(count for _, count in blocks)
+    log_terms: list[float] = []
+    for fine_counts in _compositions(total, k):
+        matches = all(
+            sum(fine_counts[class_index] for class_index in classes) == count
+            for classes, count in blocks
+        )
+        if matches:
+            log_terms.append(_fine_dm_log_evidence(fine_counts, alpha))
+    if not log_terms:
+        raise ValueError("partition has no compatible fine count vector")
+    scale = max(log_terms)
+    return scale + math.log(math.fsum(math.exp(v - scale) for v in log_terms))

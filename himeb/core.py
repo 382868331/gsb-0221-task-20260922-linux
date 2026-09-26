@@ -17,6 +17,9 @@ fit_alpha(groups, *, grid_points=201, max_iter=100) -> FitResult
 posterior_group(counts, alpha) -> GroupPosterior
 analyze(groups, *, grid_points=201, max_iter=100) -> EBResult
 
+Partial aggregate observations use :func:`partial_observation` and
+:func:`fit_alpha_partial`.
+
 Contract limits: 2 <= K <= 6, 1 <= G <= 40, non-negative integer counts.
 Numeric inputs reject NaN/Infinity; integer parameters reject ``bool``.
 """
@@ -161,6 +164,204 @@ def _validate_groups(
     return tuple(rows), k
 
 
+def _validate_partition_blocks(
+    blocks: Sequence[object], context: str
+) -> tuple[tuple[PartitionBlock, ...], int, int]:
+    """Validate that ``blocks`` is a complete partition with aggregate counts."""
+    if isinstance(blocks, (str, bytes)) or not isinstance(blocks, Sequence):
+        raise TypeError(
+            f"{context} blocks must be a sequence of (classes, count) pairs, "
+            f"got {type(blocks).__name__}"
+        )
+    block_count = len(blocks)
+    if block_count == 0:
+        raise ValueError(f"{context}: partition must contain at least one block")
+    if block_count > MAX_K:
+        raise ValueError(
+            f"{context}: partition has {block_count} blocks; K <= {MAX_K} "
+            "implies at most that many blocks"
+        )
+
+    seen: set[int] = set()
+    normalized: list[PartitionBlock] = []
+    total = 0
+    for b, block in enumerate(blocks):
+        block_context = f"{context} block {b}"
+        if isinstance(block, PartitionBlock):
+            classes: object = block.classes
+            count: object = block.count
+        else:
+            if isinstance(block, (str, bytes)) or not isinstance(
+                block, Sequence
+            ) or len(block) != 2:
+                raise TypeError(
+                    f"{block_context}: expected (classes, count), got "
+                    f"{block!r}"
+                )
+            classes, count = block
+
+        if isinstance(classes, (str, bytes)) or not isinstance(classes, Sequence):
+            raise TypeError(
+                f"{block_context}: classes must be a sequence of int class "
+                f"indices, got {type(classes).__name__}"
+            )
+        if len(classes) == 0:
+            raise ValueError(f"{block_context}: partition block cannot be empty")
+        if len(classes) > MAX_K:
+            raise ValueError(
+                f"{block_context}: block has {len(classes)} classes, but K <= "
+                f"{MAX_K}"
+            )
+
+        class_row: list[int] = []
+        for c, class_index in enumerate(classes):
+            if isinstance(class_index, bool):
+                raise TypeError(
+                    f"{block_context} class {c}: class index must be int, "
+                    "got bool"
+                )
+            if not isinstance(class_index, int):
+                raise TypeError(
+                    f"{block_context} class {c}: class index must be int, got "
+                    f"{type(class_index).__name__}: {class_index!r}"
+                )
+            if class_index < 0:
+                raise ValueError(
+                    f"{block_context} class {c}: class index must be >= 0, "
+                    f"got {class_index}"
+                )
+            if class_index >= MAX_K:
+                raise ValueError(
+                    f"{block_context} class {c}: class index {class_index} is "
+                    f"outside 0..{MAX_K - 1}"
+                )
+            if class_index in seen:
+                raise ValueError(
+                    f"{block_context} class {c}: class {class_index} is "
+                    "repeated or appears in another partition block"
+                )
+            seen.add(class_index)
+            class_row.append(class_index)
+
+        if isinstance(count, bool):
+            raise TypeError(
+                f"{block_context}: count must be int, got bool"
+            )
+        if not isinstance(count, int):
+            raise TypeError(
+                f"{block_context}: count must be int, got "
+                f"{type(count).__name__}: {count!r}"
+            )
+        if count < 0:
+            raise ValueError(
+                f"{block_context}: count must be >= 0, got {count}"
+            )
+        if count > _MAX_EXACT_COUNT:
+            raise ValueError(
+                f"{block_context}: count {count} exceeds the supported "
+                "exact-integer limit 2**53"
+            )
+        total += count
+        class_row.sort()
+        normalized.append(PartitionBlock(tuple(class_row), count))
+
+    if not seen:
+        raise ValueError(f"{context}: partition must contain original classes")
+    k = max(seen) + 1
+    if not 2 <= k <= MAX_K:
+        raise ValueError(
+            f"{context}: partition covers K={k}; require 2 <= K <= {MAX_K}"
+        )
+    missing = [class_index for class_index in range(k) if class_index not in seen]
+    if missing:
+        raise ValueError(
+            f"{context}: partition omits class(es) {tuple(missing)} for K={k}"
+        )
+
+    normalized.sort(key=lambda item: item.classes[0])
+    return tuple(normalized), k, total
+
+
+def _validate_partial_observations(
+    observations: Sequence[PartialObservation],
+) -> tuple[tuple[PartialObservation, ...], int]:
+    if isinstance(observations, (str, bytes)) or not isinstance(
+        observations, Sequence
+    ):
+        raise TypeError(
+            "observations must be a sequence of PartialObservation, got "
+            f"{type(observations).__name__}"
+        )
+    g_count = len(observations)
+    if g_count == 0:
+        raise ValueError("observations must contain at least one group")
+    if g_count > MAX_GROUPS:
+        raise ValueError(
+            f"number of groups {g_count} exceeds limit MAX_GROUPS={MAX_GROUPS}"
+        )
+
+    rows: list[PartialObservation] = []
+    k: int | None = None
+    for i, observation in enumerate(observations):
+        context = f"partial observation {i}"
+        if not isinstance(observation, PartialObservation):
+            raise TypeError(
+                f"{context}: expected PartialObservation, got "
+                f"{type(observation).__name__}"
+            )
+        if isinstance(observation.k, bool) or not isinstance(observation.k, int):
+            raise TypeError(
+                f"{context}: stored K must be int, got "
+                f"{type(observation.k).__name__}"
+            )
+        if isinstance(observation.n, bool) or not isinstance(observation.n, int):
+            raise TypeError(
+                f"{context}: stored n must be int, got "
+                f"{type(observation.n).__name__}"
+            )
+        if observation.n < 0:
+            raise ValueError(f"{context}: stored n must be >= 0")
+        if isinstance(observation.blocks, (str, bytes)) or not isinstance(
+            observation.blocks, tuple
+        ):
+            raise TypeError(
+                f"{context}: stored blocks must be a tuple of PartitionBlock, "
+                f"got {type(observation.blocks).__name__}"
+            )
+        raw_blocks: list[object] = []
+        for block in observation.blocks:
+            if isinstance(block, PartitionBlock):
+                raw_blocks.append((block.classes, block.count))
+            else:
+                raw_blocks.append(block)
+        blocks, observed_k, n = _validate_partition_blocks(
+            raw_blocks,
+            context,
+        )
+        if k is None:
+            k = observed_k
+        elif observed_k != k:
+            raise ValueError(
+                f"{context}: has K={observed_k}, expected K={k}; all samples "
+                "must partition the same original classes"
+            )
+        rebuilt_n = sum(block.count for block in blocks)
+        if observation.n != rebuilt_n:
+            raise ValueError(
+                f"{context}: stored n={observation.n} does not equal block "
+                f"count total {rebuilt_n}"
+            )
+        if observation.k != observed_k:
+            raise ValueError(
+                f"{context}: stored K={observation.k} does not equal partition "
+                f"K={observed_k}"
+            )
+        rows.append(PartialObservation(blocks, observed_k, rebuilt_n))
+
+    assert k is not None
+    return tuple(rows), k
+
+
 # ---------------------------------------------------------------------------
 # Log evidence
 # ---------------------------------------------------------------------------
@@ -214,6 +415,60 @@ def log_evidence(alpha: object, groups: Sequence[Sequence[int]]) -> float:
     a = _validate_alpha(alpha)
     rows, k = _validate_groups(groups)
     return math.fsum(_log_evidence_row(a, k, row) for row in rows)
+
+
+def _log_evidence_partial_row(
+    alpha: float, k: int, observation: PartialObservation
+) -> float:
+    """Dirichlet-multinomial evidence after aggregating partition blocks."""
+    n = observation.n
+    if n == 0:
+        return 0.0
+    log_coef = math.lgamma(n + 1) - math.fsum(
+        math.lgamma(block.count + 1) for block in observation.blocks
+    )
+    return (
+        log_coef
+        - _lgamma_add(k * alpha, n)
+        + math.fsum(
+            _lgamma_add(len(block.classes) * alpha, block.count)
+            for block in observation.blocks
+        )
+    )
+
+
+def partial_observation(blocks: Sequence[object]) -> PartialObservation:
+    """Construct and validate one aggregate observation from a partition.
+
+    Each block is ``(class_indices, count)``.  The class indices must form a
+    complete, disjoint partition of ``0, ..., K-1`` for one K in 2..6.
+    Different samples may use different partitions of the same K.
+    """
+    normalized, k, n = _validate_partition_blocks(blocks, "partial observation")
+    return PartialObservation(normalized, k, n)
+
+
+def log_evidence_partial(
+    alpha: object, observations: Sequence[PartialObservation]
+) -> float:
+    """Summed evidence for complete but possibly aggregated partitions."""
+    a = _validate_alpha(alpha)
+    rows, k = _validate_partial_observations(observations)
+    return math.fsum(_log_evidence_partial_row(a, k, row) for row in rows)
+
+
+def partial_evidence_breakdown(
+    alpha: object, observations: Sequence[PartialObservation]
+) -> PartialEvidenceBreakdown:
+    """Return total evidence and each group's separate evidence contribution."""
+    a = _validate_alpha(alpha)
+    rows, k = _validate_partial_observations(observations)
+    contributions = tuple(
+        _log_evidence_partial_row(a, k, row) for row in rows
+    )
+    return PartialEvidenceBreakdown(
+        total=math.fsum(contributions), contributions=contributions
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +640,43 @@ class EBResult:
     posteriors: tuple[GroupPosterior, ...]
 
 
+@dataclass(frozen=True)
+class PartitionBlock:
+    """One block of a partition of the original K class indices."""
+
+    classes: tuple[int, ...]
+    count: int
+
+
+@dataclass(frozen=True)
+class PartialObservation:
+    """Counts reported for a complete partition of the original K classes."""
+
+    blocks: tuple[PartitionBlock, ...]
+    k: int
+    n: int
+
+
+@dataclass(frozen=True)
+class PartialEvidenceBreakdown:
+    """Total partial-observation evidence and one contribution per sample."""
+
+    total: float
+    contributions: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class PartialFitResult:
+    """A shared-alpha fit from complete, possibly aggregated partitions."""
+
+    k: int
+    n_groups: int
+    n_nonempty_groups: int
+    n_informative_groups: int
+    fit: FitResult
+    contributions: tuple[float, ...]
+
+
 # ---------------------------------------------------------------------------
 # Fitting and posterior summaries
 # ---------------------------------------------------------------------------
@@ -537,6 +829,107 @@ def fit_alpha(
         max_iterations_used=result.max_iterations_used,
         candidates=result.candidates,
         n_nonempty_groups=len(nonempty),
+    )
+
+
+def _partial_evidence_is_constant(observation: PartialObservation) -> bool:
+    # A fully merged sample is one aggregated category and is always certain
+    # once its total is known.  A one-draw sample lands in a block with prior
+    # mass block_size/K, also independent of alpha.  Empty samples contribute
+    # zero.
+    return (
+        observation.n == 0
+        or observation.n == 1
+        or len(observation.blocks) == 1
+    )
+
+
+def fit_alpha_partial(
+    observations: Sequence[PartialObservation],
+    *,
+    grid_points: int = DEFAULT_GRID_POINTS,
+    max_iter: int = DEFAULT_MAX_ITER,
+) -> PartialFitResult:
+    """Fit the shared symmetric alpha from partially aggregated observations.
+
+    The same one-dimensional searcher used for complete counts maximizes the
+    summed evidence.  If every observation is empty, has one draw, or is fully
+    merged (zero-count blocks do not make it informative), the total evidence
+    is provably constant; the function returns ``status='flat'`` without
+    running the searcher.
+    """
+    rows, k = _validate_partial_observations(observations)
+    gp = _reject_bool_int("grid_points", grid_points, 3)
+    mi = _reject_bool_int("max_iter", max_iter, 1)
+
+    n_nonempty = sum(1 for row in rows if row.n > 0)
+    informative = tuple(
+        row for row in rows if not _partial_evidence_is_constant(row)
+    )
+
+    if not informative:
+        constant_evidence = math.fsum(
+            _log_evidence_partial_row(1.0, k, row) for row in rows
+        )
+        flat_candidates = (
+            Candidate(
+                ALPHA_MIN,
+                constant_evidence,
+                STATUS_LOWER_ENDPOINT,
+                None,
+                True,
+                0,
+            ),
+            Candidate(
+                ALPHA_MAX,
+                constant_evidence,
+                STATUS_UPPER_ENDPOINT,
+                None,
+                True,
+                0,
+            ),
+        )
+        fit = FitResult(
+            alpha=1.0,
+            log_evidence=constant_evidence,
+            status=STATUS_FLAT,
+            converged=True,
+            grid_points=gp,
+            max_iterations_used=0,
+            candidates=flat_candidates,
+            n_nonempty_groups=n_nonempty,
+        )
+    else:
+
+        def evidence_alpha(alpha: float) -> float:
+            return math.fsum(
+                _log_evidence_partial_row(alpha, k, row) for row in rows
+            )
+
+        searched = maximize_on_interval(
+            evidence_alpha, grid_points=gp, max_iter=mi
+        )
+        fit = FitResult(
+            alpha=searched.alpha,
+            log_evidence=searched.log_evidence,
+            status=searched.status,
+            converged=searched.converged,
+            grid_points=gp,
+            max_iterations_used=searched.max_iterations_used,
+            candidates=searched.candidates,
+            n_nonempty_groups=n_nonempty,
+        )
+
+    contributions = tuple(
+        _log_evidence_partial_row(fit.alpha, k, row) for row in rows
+    )
+    return PartialFitResult(
+        k=k,
+        n_groups=len(rows),
+        n_nonempty_groups=n_nonempty,
+        n_informative_groups=len(informative),
+        fit=fit,
+        contributions=contributions,
     )
 
 
