@@ -142,3 +142,72 @@ def dense_alpha_scan(
         if v > best_v:
             best_t, best_v = t, v
     return math.exp(best_t), best_v
+
+
+# ---------------------------------------------------------------------------
+# Independent reference for category-aggregated (partial) observations.
+#
+# A group reports counts y_s for the blocks of a partition of the K classes.
+# The merged evidence is independently computed here by ENUMERATING EVERY
+# FINE ALLOCATION of the y_s draws among the classes inside block s and
+# summing the ordinary Dirichlet-multinomial probabilities of the fine count
+# vectors. This is a genuinely different route (a combinatorial sum) from
+# the production additivity reduction to the merged Dirichlet-multinomial;
+# it is intended for small totals only.
+# ---------------------------------------------------------------------------
+
+
+def _compositions(total: int, parts: int):
+    """Yield every length-``parts`` tuple of non-negative ints summing total."""
+    if parts == 1:
+        yield (total,)
+        return
+    for head in range(total + 1):
+        for tail in _compositions(total - head, parts - 1):
+            yield (head,) + tail
+
+
+def _fine_log_evidence(x, k: int, alpha: float) -> float:
+    """Ordinary Dirichlet-multinomial log evidence of a fine count vector."""
+    n = sum(x)
+    log_coef = math.lgamma(n + 1) - math.fsum(
+        math.lgamma(c + 1) for c in x
+    )
+    return (
+        log_coef
+        + math.lgamma(k * alpha)
+        - math.lgamma(n + k * alpha)
+        + math.fsum(
+            math.lgamma(c + alpha) - math.lgamma(alpha) for c in x
+        )
+    )
+
+
+def merged_evidence_by_enumeration(k, blocks, counts, alpha: float) -> float:
+    """Merged log evidence via an exhaustive sum over fine allocations.
+
+    ``blocks`` is a partition of ``range(k)`` (each block a class-index tuple)
+    and ``counts`` the reported count per block. Probabilities are summed
+    with a log-sum-exp accumulator (all terms are positive).
+    """
+    allocations_per_block = [
+        list(_compositions(count, len(block)))
+        for block, count in zip(blocks, counts)
+    ]
+
+    def expand(block_index: int, fine):
+        if block_index == len(blocks):
+            x = [0] * k
+            for block, alloc in zip(blocks, fine):
+                for class_index, c in zip(block, alloc):
+                    x[class_index] = c
+            yield tuple(x)
+            return
+        for alloc in allocations_per_block[block_index]:
+            yield from expand(block_index + 1, fine + [alloc])
+
+    terms = [_fine_log_evidence(x, k, alpha) for x in expand(0, [])]
+    scale = max(terms)
+    return scale + math.log(
+        math.fsum(math.exp(term - scale) for term in terms)
+    )

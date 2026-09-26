@@ -17,6 +17,17 @@ fit_alpha(groups, *, grid_points=201, max_iter=100) -> FitResult
 posterior_group(counts, alpha) -> GroupPosterior
 analyze(groups, *, grid_points=201, max_iter=100) -> EBResult
 
+Partial (category-aggregated) observations, where each group reports counts
+for the sets of a partition of the original K classes (different groups may
+use different partitions)::
+
+    log_evidence_partial(alpha, k, observations) -> float
+    fit_alpha_partial(k, observations, *, ...) -> PartialFitResult
+
+Each observation is a sequence of ``(block, count)`` pairs; ``block`` is a
+sequence of class indices and the blocks must form a complete partition of
+``range(k)``. A block of m classes carries the symmetric parameter m*alpha.
+
 Contract limits: 2 <= K <= 6, 1 <= G <= 40, non-negative integer counts.
 Numeric inputs reject NaN/Infinity; integer parameters reject ``bool``.
 """
@@ -161,6 +172,138 @@ def _validate_groups(
     return tuple(rows), k
 
 
+def _validate_partial_observations(
+    k: object,
+    observations: Sequence[Sequence[tuple[Sequence[int], int]]],
+) -> tuple[int, tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]]:
+    """Validate (K, observations) with per-group class partitions.
+
+    Every observation is a sequence of ``(block, count)`` pairs. The blocks
+    must be a complete partition of ``range(k)``: duplicated class indices,
+    missing classes, overlapping blocks, empty blocks or out-of-range
+    indices are all rejected. All checking happens before any result is
+    produced; the functions consuming this are pure.
+    """
+    if isinstance(k, bool):
+        raise TypeError("k must be int, got bool (bool is not accepted)")
+    if not isinstance(k, int):
+        raise TypeError(f"k must be int, got {type(k).__name__}: {k!r}")
+    if not 2 <= k <= MAX_K:
+        raise ValueError(f"k={k}; require 2 <= k <= {MAX_K}")
+
+    if isinstance(
+        observations, (str, bytes)
+    ) or not isinstance(observations, Sequence):
+        raise TypeError(
+            "observations must be a sequence of partitions, got "
+            f"{type(observations).__name__}"
+        )
+    g_count = len(observations)
+    if g_count == 0:
+        raise ValueError("observations must contain at least one group")
+    if g_count > MAX_GROUPS:
+        raise ValueError(
+            f"number of groups {g_count} exceeds limit MAX_GROUPS="
+            f"{MAX_GROUPS}"
+        )
+
+    validated: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    for gi, observation in enumerate(observations):
+        if isinstance(
+            observation, (str, bytes)
+        ) or not isinstance(observation, Sequence):
+            raise TypeError(
+                f"group {gi}: observation must be a sequence of "
+                f"(block, count) pairs, got {type(observation).__name__}"
+            )
+        if len(observation) == 0:
+            raise ValueError(
+                f"group {gi}: partition must contain at least one block"
+            )
+
+        seen = [False] * k
+        blocks: list[tuple[int, ...]] = []
+        counts: list[int] = []
+        for bi, item in enumerate(observation):
+            where = f"group {gi} block {bi}"
+            if (
+                isinstance(item, (str, bytes))
+                or not isinstance(item, Sequence)
+                or len(item) != 2
+            ):
+                raise TypeError(
+                    f"{where}: each partition entry must be a "
+                    "(block, count) pair"
+                )
+            raw_block, count = item
+            if isinstance(
+                raw_block, (str, bytes)
+            ) or not isinstance(raw_block, Sequence):
+                raise TypeError(
+                    f"{where}: block must be a sequence of class indices, "
+                    f"got {type(raw_block).__name__}"
+                )
+            if len(raw_block) == 0:
+                raise ValueError(f"{where}: block must be non-empty")
+
+            block: list[int] = []
+            for class_index in raw_block:
+                if isinstance(class_index, bool):
+                    raise TypeError(
+                        f"{where}: class index must be int, got bool "
+                        "(bool is not accepted as a class index)"
+                    )
+                if not isinstance(class_index, int):
+                    raise TypeError(
+                        f"{where}: class index must be int, got "
+                        f"{type(class_index).__name__}: {class_index!r}"
+                    )
+                if not 0 <= class_index < k:
+                    raise ValueError(
+                        f"{where}: class index {class_index} out of range "
+                        f"for K={k}"
+                    )
+                if seen[class_index]:
+                    raise ValueError(
+                        f"{where}: class {class_index} appears more than "
+                        "once; blocks must not overlap or repeat classes"
+                    )
+                seen[class_index] = True
+                block.append(class_index)
+
+            if isinstance(count, bool):
+                raise TypeError(
+                    f"{where}: count must be int, got bool "
+                    "(bool is not accepted as a count)"
+                )
+            if not isinstance(count, int):
+                raise TypeError(
+                    f"{where}: count must be int, got "
+                    f"{type(count).__name__}: {count!r}"
+                )
+            if count < 0:
+                raise ValueError(
+                    f"{where}: count must be >= 0, got {count}"
+                )
+            if count > _MAX_EXACT_COUNT:
+                raise ValueError(
+                    f"{where}: count {count} exceeds the supported "
+                    "exact-integer limit 2**53"
+                )
+            blocks.append(tuple(block))
+            counts.append(count)
+
+        missing = [j for j, found in enumerate(seen) if not found]
+        if missing:
+            raise ValueError(
+                f"group {gi}: partition omits class(es) {missing}; it "
+                "must cover every class exactly once"
+            )
+        validated.append((tuple(blocks), tuple(counts)))
+
+    return k, tuple(validated)
+
+
 # ---------------------------------------------------------------------------
 # Log evidence
 # ---------------------------------------------------------------------------
@@ -214,6 +357,77 @@ def log_evidence(alpha: object, groups: Sequence[Sequence[int]]) -> float:
     a = _validate_alpha(alpha)
     rows, k = _validate_groups(groups)
     return math.fsum(_log_evidence_row(a, k, row) for row in rows)
+
+
+def _log_evidence_merged_row(
+    alpha: float,
+    k: int,
+    blocks: tuple[tuple[int, ...], ...],
+    counts: tuple[int, ...],
+) -> float:
+    """Log evidence of one category-aggregated observation.
+
+    Aggregating a symmetric Dirichlet over a block of m classes gives a
+    symmetric Dirichlet with parameter m*alpha; the block-level counts are
+    therefore again Dirichlet-multinomial (with L categories, parameters
+    m_s*alpha). This is exact: summing a fine-grained marginal likelihood
+    over every fine allocation consistent with the block counts gives the
+    same merged marginal likelihood by additivity of the alpha parameters.
+    """
+    n = sum(counts)
+    if n == 0:
+        # An empty draw has probability 1 for every alpha.
+        return 0.0
+    params = tuple(alpha * len(block) for block in blocks)
+    log_coef = math.lgamma(n + 1) - math.fsum(
+        math.lgamma(c + 1) for c in counts
+    )
+    total_param = alpha * k  # sum_s m_s * alpha
+    return (
+        log_coef
+        - _lgamma_add(total_param, n)
+        + math.fsum(
+            _lgamma_add(param, c) for param, c in zip(params, counts)
+        )
+    )
+
+
+def _row_is_alpha_constant(
+    blocks: tuple[tuple[int, ...], ...], counts: tuple[int, ...]
+) -> bool:
+    """True iff the merged row carries no information about alpha.
+
+    Two proved cases: an empty row (n=0, evidence 0) and a single reported
+    block (the fully merged partition; its draw is certain) OR n=1 (a lone
+    draw lands in block s with prior probability m_s/K, independent of
+    alpha). A row with n >= 2 and at least two blocks is informative.
+    """
+    n = sum(counts)
+    if n <= 1:
+        return True
+    return len(blocks) <= 1
+
+
+def log_evidence_partial(
+    alpha: object,
+    k: int,
+    observations: Sequence[Sequence[tuple[Sequence[int], int]]],
+) -> float:
+    """Summed log evidence for category-aggregated observations.
+
+    Each observation is a sequence of ``(block, count)`` pairs, where
+    ``block`` is a sequence of original class indices and the blocks form a
+    complete partition of ``range(k)`` (different groups may use different
+    partitions). The prior stays the single symmetric Dirichlet(alpha,...):
+    a block of m classes uses the aggregated parameter m*alpha -- no extra
+    asymmetric parameter set.
+    """
+    a = _validate_alpha(alpha)
+    kk, validated = _validate_partial_observations(k, observations)
+    return math.fsum(
+        _log_evidence_merged_row(a, kk, blocks, counts)
+        for blocks, counts in validated
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +599,23 @@ class EBResult:
     posteriors: tuple[GroupPosterior, ...]
 
 
+@dataclass(frozen=True)
+class PartialFitResult:
+    """Shared-alpha fit from category-aggregated observations.
+
+    ``group_log_evidence`` holds the per-group evidence contribution at the
+    fitted (or conventional flat-case) alpha; the search itself only ever
+    sees the informative groups (n >= 2 with at least two blocks), because
+    every other contribution is an analytic constant in alpha.
+    """
+
+    k: int
+    n_groups: int
+    n_informative_groups: int
+    fit: FitResult
+    group_log_evidence: tuple[float, ...]
+
+
 # ---------------------------------------------------------------------------
 # Fitting and posterior summaries
 # ---------------------------------------------------------------------------
@@ -537,6 +768,109 @@ def fit_alpha(
         max_iterations_used=result.max_iterations_used,
         candidates=result.candidates,
         n_nonempty_groups=len(nonempty),
+    )
+
+
+def fit_alpha_partial(
+    k: int,
+    observations: Sequence[Sequence[tuple[Sequence[int], int]]],
+    *,
+    grid_points: int = DEFAULT_GRID_POINTS,
+    max_iter: int = DEFAULT_MAX_ITER,
+) -> PartialFitResult:
+    """Fit the shared symmetric alpha from category-aggregated observations.
+
+    Reuses the same bracket search as :func:`fit_alpha` over the summed
+    evidence, which is the sum of the (exact) merged Dirichlet-multinomial
+    contributions. Rows that are provably constant in alpha -- empty rows,
+    single draws (a lone draw hits block s with prior mass m_s/K), and fully
+    merged rows (the single-block partition makes the draw certain) -- are
+    excluded from the objective but kept in the reported contributions.
+
+    When every observation is alpha-constant the total evidence is itself a
+    proved constant; the function returns ``status='flat'`` with the
+    conventional alpha = 1.0 WITHOUT running the search, rather than
+    interpreting a stopped searcher as an identified parameter.
+    """
+    kk, validated = _validate_partial_observations(k, observations)
+    gp = _reject_bool_int("grid_points", grid_points, 3)
+    mi = _reject_bool_int("max_iter", max_iter, 1)
+
+    informative = tuple(
+        (blocks, counts)
+        for blocks, counts in validated
+        if not _row_is_alpha_constant(blocks, counts)
+    )
+    constant_contribution = math.fsum(
+        _log_evidence_merged_row(1.0, kk, blocks, counts)
+        for blocks, counts in validated
+        if _row_is_alpha_constant(blocks, counts)
+    )
+
+    def evidence_at(alpha: float) -> float:
+        return math.fsum(
+            _log_evidence_merged_row(alpha, kk, blocks, counts)
+            for blocks, counts in informative
+        )
+
+    if not informative:
+        # Every contribution is an analytic constant: no information about
+        # alpha exists in the batch. This is a proved flat case, not a
+        # stopped/budget-exhausted search.
+        fit = FitResult(
+            alpha=1.0,
+            log_evidence=constant_contribution,
+            status=STATUS_FLAT,
+            converged=True,
+            grid_points=gp,
+            max_iterations_used=0,
+            candidates=(
+                Candidate(
+                    ALPHA_MIN, constant_contribution,
+                    STATUS_LOWER_ENDPOINT, None, True, 0,
+                ),
+                Candidate(
+                    ALPHA_MAX, constant_contribution,
+                    STATUS_UPPER_ENDPOINT, None, True, 0,
+                ),
+            ),
+            n_nonempty_groups=0,
+        )
+    else:
+        searched = maximize_on_interval(
+            evidence_at, grid_points=gp, max_iter=mi
+        )
+        fit = FitResult(
+            alpha=searched.alpha,
+            log_evidence=searched.log_evidence + constant_contribution,
+            status=searched.status,
+            converged=searched.converged,
+            grid_points=gp,
+            max_iterations_used=searched.max_iterations_used,
+            candidates=tuple(
+                Candidate(
+                    c.alpha,
+                    c.log_evidence + constant_contribution,
+                    c.kind,
+                    c.bracket,
+                    c.converged,
+                    c.iterations,
+                )
+                for c in searched.candidates
+            ),
+            n_nonempty_groups=len(informative),
+        )
+
+    contributions = tuple(
+        _log_evidence_merged_row(fit.alpha, kk, blocks, counts)
+        for blocks, counts in validated
+    )
+    return PartialFitResult(
+        k=kk,
+        n_groups=len(validated),
+        n_informative_groups=len(informative),
+        fit=fit,
+        group_log_evidence=contributions,
     )
 
 
